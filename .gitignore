@@ -28,3 +28,6 @@ Thumbs.db
 *.tar.gz
 *.zip
 *.sha256
+
+# Sound Blaster diagnostic reports
+soundblaster-diagnostics-*.txt
