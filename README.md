@@ -1,3 +1,29 @@
+## Community testing
+
+Sound Blaster Linux Control Center is now available for Linux community testing.
+
+### Hardware-tested platforms
+
+- **Ubuntu 26.04.1 LTS**
+- **Bazzite / Fedora Atomic**
+
+### Community testing requested
+
+The following platforms have installer/support paths but have not yet been hardware-verified by the project maintainer:
+
+- **Fedora Workstation**
+- **Arch-family distributions**
+- **openSUSE**
+- **Debian-family distributions other than Ubuntu**
+
+If you test the application on one of these platforms, please report your results through **GitHub Issues**. Successful installation and successful testing are both valuable feedback.
+
+When reporting a problem, please include your Linux distribution/version, Sound Blaster model, PipeWire version, WirePlumber version, and the relevant details of what happened.
+
+The repository includes a privacy-conscious `collect_diagnostics.sh` utility that can collect useful audio-stack information for bug reports.
+
+**This project does not consider a distribution hardware-verified simply because the installer detects it. Hardware verification requires an actual test on that platform.**
+
 # Sound Blaster Linux Control Center 3.3.35
 
 ## 3.3.24 REDIRECT level and LFE overload protection
