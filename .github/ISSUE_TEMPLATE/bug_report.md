@@ -1,38 +1,66 @@
 ---
 name: Bug report
-about: Create a report to help us improve
-title: ''
+about: Report an installation, compatibility, or audio problem
+title: "[BUG] "
 labels: ''
 assignees: ''
 
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+## Describe the problem
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+Please describe what went wrong and what you were doing when it happened.
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+## Distribution
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+- Linux distribution:
+- Distribution version:
+- Desktop environment:
+- Wayland or X11:
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+## Hardware
 
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+- Sound Blaster model:
+- Connection: PCI / PCIe / USB / other
+- Other relevant audio hardware:
 
-**Additional context**
-Add any other context about the problem here.
+## Audio software
+
+- Sound Blaster Linux Control Center version:
+- PipeWire version:
+- WirePlumber version:
+- Kernel version:
+
+## What happened?
+
+Please describe the actual behavior.
+
+## Expected behavior
+
+What did you expect to happen?
+
+## Steps to reproduce
+
+1.
+2.
+3.
+
+## Diagnostic report
+
+If possible, run:
+
+    ./collect_diagnostics.sh
+
+from the Sound Blaster Linux Control Center directory and attach the resulting:
+
+    soundblaster-diagnostics-*.txt
+
+Please review the diagnostic report before attaching it and remove anything you do not want to share.
+
+## Screenshots
+
+If applicable, attach screenshots showing the problem.
+
+## Additional information
+
+Include any other information that may help reproduce or diagnose the problem.
