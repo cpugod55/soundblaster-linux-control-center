@@ -1,3 +1,10 @@
+## **3.3.36**
+
+- Add capability-driven Sound Blaster analog 5.1 profile activation for compatible CA0132 devices.
+- Improve multichannel detection when PipeWire initially selects an analog stereo profile.
+- Add regression coverage for 5.1 profile activation and existing surround/AC3 sink preservation.
+- Add GitHub Sponsors funding configuration and project support information.
+
 ## 3.3.35
 
 - Hardens upgrades by backing up the active `state.json` before installer migration/normalization.

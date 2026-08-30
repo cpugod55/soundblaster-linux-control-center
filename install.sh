@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.3.35"
+VERSION="3.3.36"
 APP_ID="soundblaster-zse-control"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP_SRC="$HERE/app/soundblaster_zse_control.py"
@@ -430,7 +430,7 @@ if parts <= (3,3,24):
         if key in cur:
             cur[key]=max(0.0,min(100.0,math.pow(10.0,float(cur[key])/60.0)*100.0))
 cur.setdefault('safe_headroom',True); cur.setdefault('auto_reconnect',True)
-data['version']='3.3.35'
+data['version']='3.3.36'
 tmp=p.with_name(p.name+'.install-tmp')
 tmp.write_text(json.dumps(data,indent=2))
 json.loads(tmp.read_text())

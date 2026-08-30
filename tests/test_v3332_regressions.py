@@ -10,7 +10,7 @@ class V3332RegressionTests(unittest.TestCase):
         cls.text = APP.read_text()
 
     def test_version(self):
-        self.assertIn('VERSION = "3.3.35"', self.text)
+        self.assertIn('VERSION = "3.3.36"', self.text)
 
     def test_live_meters_use_isolated_mono_recorders(self):
         self.assertIn('"--channels=1", "--channel-map=MONO"', self.text)

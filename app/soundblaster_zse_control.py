@@ -19,7 +19,7 @@ from tkinter import ttk, messagebox, simpledialog
 
 APP_NAME = "Sound Blaster Linux Control Center"
 APP_ID = "soundblaster-zse-control"
-VERSION = "3.3.35"
+VERSION = "3.3.36"
 SINK = "soundblaster_zse_eq"
 OUTPUT_NODE = "soundblaster_zse_eq_output"
 FILL_SINK = "soundblaster_zse_fill"
@@ -296,6 +296,103 @@ def detect_hardware_sink():
     return ""
 
 
+def _pactl_sink_block(sink_name):
+    """Return the pactl sink block for a named sink."""
+    if not sink_name:
+        return ""
+    result = run(["pactl", "list", "sinks"], capture=True)
+    if result.returncode != 0:
+        return ""
+    for block in re.split(r"\n(?=Sink #)", result.stdout):
+        if re.search(rf"(?m)^\s*Name: {re.escape(sink_name)}\s*$", block):
+            return block
+    return ""
+
+
+def _pactl_card_for_sink(sink_name):
+    """Return the Pulse/PipeWire card index owning a sink, if available."""
+    block = _pactl_sink_block(sink_name)
+    match = re.search(r"(?m)^\s*Card: (\d+)\s*$", block)
+    return int(match.group(1)) if match else None
+
+
+def _pactl_card_block(card_index):
+    """Return one pactl card block by numeric card index."""
+    result = run(["pactl", "list", "cards"], capture=True)
+    if result.returncode != 0:
+        return ""
+    for block in re.split(r"\n(?=Card #)", result.stdout):
+        if re.search(rf"(?m)^Card #{int(card_index)}\b", block):
+            return block
+    return ""
+
+
+def _pactl_card_is_soundblaster(card_index):
+    """Limit automatic profile selection to CA0132/Sound Blaster hardware."""
+    block = _pactl_card_block(card_index)
+    if not block:
+        return False
+    text = block.lower()
+    return any(token in text for token in (
+        "ca0132", "sound blaster", "sound core3d", "recon3d",
+    ))
+
+
+def _pactl_card_profile_available(card_index, profile_name):
+    """Return True when a specific card profile is present and available."""
+    block = _pactl_card_block(card_index)
+    if not block:
+        return False
+    for line in block.splitlines():
+        match = re.match(r"\s*([^:]+):.*\(priority [^,]+, available: (yes|no)\)", line)
+        if match and match.group(1).strip() == profile_name:
+            return match.group(2) == "yes"
+    return False
+
+
+def _pactl_surround51_sink_for_card(card_index):
+    """Find the analog 5.1 sink belonging to a particular card."""
+    result = run(["pactl", "list", "sinks"], capture=True)
+    if result.returncode != 0:
+        return ""
+    for block in re.split(r"\n(?=Sink #)", result.stdout):
+        card = re.search(r"(?m)^\s*Card: (\d+)\s*$", block)
+        name = re.search(r"(?m)^\s*Name: (\S+)\s*$", block)
+        if card and name and int(card.group(1)) == int(card_index) and "surround-51" in name.group(1):
+            return name.group(1)
+    return ""
+
+
+def activate_analog_surround51_profile(target_sink):
+    """Activate an available analog 5.1 profile for a compatible Sound Blaster.
+
+    This is intentionally capability-driven: an existing surround/AC3 sink is
+    left alone, and automatic profile selection is attempted only when the
+    selected sink belongs to a CA0132/Sound Blaster card that explicitly
+    exposes an available output:analog-surround-51 profile.
+    """
+    if not target_sink or target_sink == SINK:
+        return target_sink
+    if "surround-51" in target_sink or "ac3" in target_sink.lower():
+        return target_sink
+    card_index = _pactl_card_for_sink(target_sink)
+    if card_index is None or not _pactl_card_is_soundblaster(card_index):
+        return target_sink
+    profile = "output:analog-surround-51"
+    if not _pactl_card_profile_available(card_index, profile):
+        return target_sink
+    result = run(["pactl", "set-card-profile", str(card_index), profile], capture=True)
+    if result.returncode != 0:
+        return target_sink
+    end = time.time() + 8
+    while time.time() < end:
+        refreshed = _pactl_surround51_sink_for_card(card_index)
+        if refreshed:
+            return refreshed
+        time.sleep(0.25)
+    return target_sink
+
+
 def normalize_channel_positions(value):
     """Return a PipeWire channel map like ["FL", "FR", ...] from pw-dump data."""
     if isinstance(value, list):
@@ -550,6 +647,12 @@ def ensure_configs(data, force=False):
     target = data["current"].get("hardware_sink") or existing_target or detect_hardware_sink()
     if not target or target == SINK:
         raise RuntimeError("No physical output sink could be detected. Choose one in Device Setup.")
+    # If the selected physical sink is only stereo but its owning card exposes
+    # an available analog 5.1 profile, activate that profile before discovering
+    # channel positions or generating the EQ graph.  Existing AC3/5.1 sinks are
+    # left untouched.
+    target = activate_analog_surround51_profile(target)
+    target = detect_hardware_sink() or target
     data["current"]["hardware_sink"] = target
     EQ_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     FILL_CONFIG.parent.mkdir(parents=True, exist_ok=True)

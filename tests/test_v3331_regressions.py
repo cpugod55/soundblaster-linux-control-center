@@ -10,7 +10,7 @@ class V3331RegressionTests(unittest.TestCase):
         cls.text = APP.read_text()
 
     def test_version(self):
-        self.assertIn('VERSION = "3.3.35"', self.text)
+        self.assertIn('VERSION = "3.3.36"', self.text)
 
     def test_meter_uses_explicit_pipewire_links(self):
         self.assertIn('["pw-record", "--raw", "--target=0"', self.text)

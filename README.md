@@ -24,6 +24,12 @@ The repository includes a privacy-conscious `collect_diagnostics.sh` utility tha
 
 **This project does not consider a distribution hardware-verified simply because the installer detects it. Hardware verification requires an actual test on that platform.**
 
+## Support the project
+
+If Sound Blaster Linux Control Center is useful to you, you can support continued development through GitHub Sponsors.
+
+The repository includes a GitHub funding configuration so the **Sponsor** option can be displayed when GitHub Sponsors is enabled for the maintainer account.
+
 # Sound Blaster Linux Control Center 3.3.35
 
 ## 3.3.24 REDIRECT level and LFE overload protection

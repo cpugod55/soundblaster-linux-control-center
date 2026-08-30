@@ -10,8 +10,8 @@ TROUBLE = (ROOT / 'TROUBLESHOOTING.md').read_text()
 
 class PersistenceHardeningTests(unittest.TestCase):
     def test_version(self):
-        self.assertIn('VERSION = "3.3.35"', APP)
-        self.assertIn('VERSION="3.3.35"', INSTALL)
+        self.assertIn('VERSION = "3.3.36"', APP)
+        self.assertIn('VERSION="3.3.36"', INSTALL)
 
     def test_app_state_write_is_atomic_and_keeps_previous(self):
         self.assertIn('STATE_FILE.name + ".tmp"', APP)

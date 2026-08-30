@@ -6,7 +6,7 @@ APP = (ROOT / "app" / "soundblaster_zse_control.py").read_text()
 
 class V3333RegressionTests(unittest.TestCase):
     def test_version(self):
-        self.assertIn('VERSION = "3.3.35"', APP)
+        self.assertIn('VERSION = "3.3.36"', APP)
     def test_crossover_uses_dark_disabled_style(self):
         self.assertIn('style.configure("SpeakerFill.TRadiobutton", background=CARD, foreground=TEXT)', APP)
         self.assertIn('background=[("disabled", CARD), ("active", CARD)]', APP)

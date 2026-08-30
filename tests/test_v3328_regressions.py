@@ -12,10 +12,10 @@ class V3328RegressionTests(unittest.TestCase):
         cls.tree = ast.parse(cls.text)
 
     def test_version_and_installer_stamp(self):
-        self.assertIn('VERSION = "3.3.35"', self.text)
+        self.assertIn('VERSION = "3.3.36"', self.text)
         install = INSTALL.read_text()
-        self.assertIn('VERSION="3.3.35"', install)
-        self.assertIn("data['version']='3.3.35'", install)
+        self.assertIn('VERSION="3.3.36"', install)
+        self.assertIn("data['version']='3.3.36'", install)
 
     def test_live_meters_use_native_multichannel_capture(self):
         self.assertNotIn('def _start_semantic_meter_procs', self.text)

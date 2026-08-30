@@ -10,7 +10,7 @@ class V3330RegressionTests(unittest.TestCase):
         cls.text = APP.read_text()
 
     def test_version(self):
-        self.assertIn('VERSION = "3.3.35"', self.text)
+        self.assertIn('VERSION = "3.3.36"', self.text)
 
     def test_meter_prefers_physical_monitor(self):
         self.assertIn('candidate = f"{target}.monitor"', self.text)
