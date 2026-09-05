@@ -254,8 +254,8 @@ Project signature/contact: **!!ZuEs!!** — GitHub Issues
 For most users:
 
 ```bash
-tar -xzf soundblaster-linux-control-center-3.3.35.tar.gz
-cd soundblaster-linux-control-center-3.3.35
+tar -xzf soundblaster-linux-control-center-3.3.38.tar.gz
+cd soundblaster-linux-control-center-3.3.38
 ./install.sh
 ```
 
