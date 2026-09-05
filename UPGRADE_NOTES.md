@@ -1,3 +1,15 @@
+## v3.3.38
+
+This release fixes a remaining case where a real analog 5.1 Sound Blaster sink could be regenerated as a 2.0 EQ sink after reboot. The installer and application now prefer the real `Audio/Sink` entry when PipeWire exposes duplicate matching objects, and `analog-surround-51` targets are protected from transient stereo fallback.
+
+## 3.3.38
+
+- Arch/CachyOS and Fedora now install the correct ZaMaxim LADSPA package automatically on mutable systems; Bazzite/Fedora Atomic reports the package for host layering.
+- Existing root-owned `~/.config/pipewire` directories are detected before writes. Use the installer-provided `chown` command, then rerun `./install.sh` without sudo.
+- `filter-chain.service` is started and verified on any distro that provides the user unit.
+- A valid quoted six-channel WirePlumber map no longer collapses the generated EQ sink to 2.0.
+- The CA0132 analog channel-map correction is available only when explicitly requested with `--ca0132-channel-fix`; existing manual WirePlumber corrections are left untouched.
+
 ## 3.3.35
 
 Bazzite Channel Levels now target the saved physical 5.1/AC3 sink instead of the virtual `soundblaster_zse_eq` sink. Manual testing showed Bazzite accepted virtual-sink per-channel volume readback but did not attenuate the actual output; applying the same six values to the physical sink correctly muted the selected speaker. Ubuntu keeps the existing v3.3.33 channel-level path unchanged.

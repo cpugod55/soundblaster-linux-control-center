@@ -7,7 +7,7 @@ APP = (ROOT / "app" / "soundblaster_zse_control.py").read_text()
 
 class V3334RegressionTests(unittest.TestCase):
     def test_version(self):
-        self.assertIn('VERSION = "3.3.36"', APP)
+        self.assertIn('VERSION = "3.3.38"', APP)
 
     def test_bazzite_channel_levels_select_physical_sink(self):
         helper = APP[APP.index('def channel_level_sink'):APP.index('def read_channel_levels', APP.index('def channel_level_sink'))]

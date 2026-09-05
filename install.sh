@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.3.36"
+VERSION="3.3.38"
 APP_ID="soundblaster-zse-control"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP_SRC="$HERE/app/soundblaster_zse_control.py"
@@ -20,6 +20,8 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 TARGET=""
 RESTART=1
 SETUP_OPTICAL=1
+CA0132_CHANNEL_FIX=0
+CA0132_WP_CONF="$HOME/.config/wireplumber/wireplumber.conf.d/51-ca0132-channel-map.conf"
 
 # This is a user-local installer. Running the installer itself with sudo would
 # redirect HOME-owned application/state paths to root and can make an upgrade
@@ -35,13 +37,16 @@ usage() {
   cat <<EOF
 Sound Blaster Linux Control Center $VERSION installer
 
-Usage: ./install.sh [--sink PIPEWIRE_SINK] [--no-restart]
+Usage: ./install.sh [--sink PIPEWIRE_SINK] [--no-restart] [--ca0132-channel-fix]
 
   --sink NAME      Physical 5.1 PipeWire/Pulse sink to receive Sound Blaster EQ output.
                    If omitted, the installer preserves an existing target or
                    tries to detect a 5.1 surround/AC3 sink.
   --no-restart     Install files without restarting the user PipeWire services.
   --no-optical-setup  Do not attempt to install Ubuntu A52/AC3 support when missing.
+  --ca0132-channel-fix  Apply the verified Sound Blaster Z/CA0132 analog 5.1
+                        WirePlumber map [ FL FR FC LFE RL RR ]. This is opt-in
+                        until it has been validated on more CA0132 systems.
 EOF
 }
 
@@ -50,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --sink) TARGET="${2:-}"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --no-optical-setup) SETUP_OPTICAL=0; shift ;;
+    --ca0132-channel-fix) CA0132_CHANNEL_FIX=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -87,6 +93,12 @@ have_a52() {
   fi
 }
 
+have_zamaxim() {
+  [[ -f /usr/lib/ladspa/ZaMaximX2-ladspa.so ]] ||
+  [[ -f /usr/lib64/ladspa/ZaMaximX2-ladspa.so ]] ||
+  find /usr/lib /usr/lib64 -type f -path '*/ladspa/ZaMaximX2-ladspa.so' -print -quit 2>/dev/null | grep -q .
+}
+
 install_apt_deps() {
   local need=()
   command -v python3 >/dev/null 2>&1 || need+=(python3)
@@ -96,7 +108,7 @@ install_apt_deps() {
   command -v pw-cli >/dev/null 2>&1 || need+=(pipewire-bin)
   command -v pw-loopback >/dev/null 2>&1 || need+=(pipewire-bin)
   command -v pw-record >/dev/null 2>&1 || need+=(pipewire-bin)
-  [[ -f /usr/lib/ladspa/ZaMaximX2-ladspa.so ]] || need+=(zam-plugins)
+  have_zamaxim || need+=(zam-plugins)
   if [[ $SETUP_OPTICAL -eq 1 ]] && ! have_a52; then need+=(libasound2-plugins); fi
   if (( ${#need[@]} )); then
     echo "Installing Debian/Ubuntu dependencies: ${need[*]}"
@@ -114,6 +126,7 @@ install_fedora_deps() {
   command -v pw-cli >/dev/null 2>&1 || need+=(pipewire-utils)
   command -v pw-loopback >/dev/null 2>&1 || need+=(pipewire-utils)
   command -v wireplumber >/dev/null 2>&1 || need+=(wireplumber)
+  have_zamaxim || need+=(ladspa-zam-plugins)
   if [[ $SETUP_OPTICAL -eq 1 ]] && ! have_a52; then need+=(alsa-plugins-a52); fi
   if (( ${#need[@]} )); then
     echo "Installing Fedora dependencies: ${need[*]}"
@@ -134,6 +147,7 @@ install_arch_deps() {
   command -v pw-cli >/dev/null 2>&1 || need+=(pipewire)
   command -v pw-loopback >/dev/null 2>&1 || need+=(pipewire)
   command -v wireplumber >/dev/null 2>&1 || need+=(wireplumber)
+  have_zamaxim || need+=(zam-plugins-ladspa)
   # Arch ships pcm_a52 in alsa-plugins; ffmpeg supplies the codec dependency.
   if [[ $SETUP_OPTICAL -eq 1 ]] && ! have_a52; then need+=(alsa-plugins ffmpeg); fi
   if (( ${#need[@]} )); then
@@ -151,6 +165,7 @@ check_bazzite_deps() {
   command -v pw-cli >/dev/null 2>&1 || missing+=(pipewire-utils)
   command -v pw-loopback >/dev/null 2>&1 || missing+=(pipewire-utils)
   command -v wireplumber >/dev/null 2>&1 || missing+=(wireplumber)
+  have_zamaxim || missing+=(ladspa-zam-plugins)
   if [[ $SETUP_OPTICAL -eq 1 ]] && ! have_a52; then missing+=(alsa-plugins-a52); fi
   if (( ${#missing[@]} )); then
     echo ""
@@ -199,7 +214,34 @@ if ! command -v parec >/dev/null 2>&1; then
   echo "NOTE: parec was not found. Audio processing will work, but spectrum/channel meters may be unavailable."
 fi
 
-mkdir -p "$LIB_DIR" "$BIN_DIR" "$APP_DIR" "$AUTOSTART_DIR" "$STATE_DIR" "$(dirname "$EQ_CONF")" "$(dirname "$FILL_CONF")"
+# Refuse to write through root-owned/unwritable user PipeWire config paths.
+# This catches damage left by older installs that were accidentally run with sudo
+# and replaces a Python PermissionError traceback with one precise repair command.
+check_user_config_path() {
+  local p="$1" owner="unknown"
+  if [[ -e "$p" && ! -w "$p" ]]; then
+    owner="$(stat -c '%U:%G' "$p" 2>/dev/null || echo unknown)"
+    echo "ERROR: $p is not writable by $(id -un) (owner: $owner)." >&2
+    echo "Repair ownership, then rerun the installer without sudo:" >&2
+    echo "  sudo chown -R \"$(id -un):$(id -gn)\" \"$HOME/.config/pipewire\"" >&2
+    exit 1
+  fi
+}
+check_user_config_path "$HOME/.config"
+check_user_config_path "$HOME/.config/pipewire"
+check_user_config_path "$(dirname "$EQ_CONF")"
+check_user_config_path "$(dirname "$FILL_CONF")"
+if [[ $CA0132_CHANNEL_FIX -eq 1 ]]; then
+  check_user_config_path "$HOME/.config/wireplumber"
+  check_user_config_path "$(dirname "$CA0132_WP_CONF")"
+fi
+
+if ! mkdir -p "$LIB_DIR" "$BIN_DIR" "$APP_DIR" "$AUTOSTART_DIR" "$STATE_DIR" "$(dirname "$EQ_CONF")" "$(dirname "$FILL_CONF")"; then
+  echo "ERROR: Could not create user configuration directories." >&2
+  echo "If ~/.config/pipewire is root-owned, repair it with:" >&2
+  echo "  sudo chown -R \"$(id -un):$(id -gn)\" \"$HOME/.config/pipewire\"" >&2
+  exit 1
+fi
 
 backup_if_exists() {
   local f="$1"
@@ -275,6 +317,43 @@ fi
 
 echo "Hardware target: $TARGET"
 
+if [[ $CA0132_CHANNEL_FIX -eq 1 ]]; then
+  if [[ "$TARGET" != *"analog-surround-51"* ]]; then
+    echo "ERROR: --ca0132-channel-fix requires an analog-surround-51 target; detected: $TARGET" >&2
+    exit 1
+  fi
+  if ! pactl list cards 2>/dev/null | grep -Eqi 'CA0132|Sound Blaster|Sound Core3D|Recon3D'; then
+    echo "ERROR: --ca0132-channel-fix requested, but no CA0132/Sound Blaster card was detected." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$CA0132_WP_CONF")"
+  backup_if_exists "$CA0132_WP_CONF"
+  cat > "$CA0132_WP_CONF" <<'EOF'
+monitor.alsa.rules = [
+  {
+    matches = [
+      {
+        alsa.id = "Creative"
+        api.alsa.path = "surround51:0"
+        device.profile.name = "analog-surround-51"
+      }
+    ]
+    actions = {
+      update-props = {
+        audio.position = [ "FL", "FR", "FC", "LFE", "RL", "RR" ]
+      }
+    }
+  }
+]
+EOF
+  echo "Installed opt-in CA0132 analog 5.1 WirePlumber channel-map correction."
+  systemctl --user restart wireplumber
+  for _ in {1..20}; do
+    pactl list short sinks 2>/dev/null | grep -qF "$TARGET" && break
+    sleep 0.25
+  done
+fi
+
 cp "$APP_SRC" "$LIB_DIR/control.py"
 rm -rf "$LIB_DIR/assets"
 if [[ -d "$ASSET_SRC" ]]; then cp -a "$ASSET_SRC" "$LIB_DIR/assets"; fi
@@ -305,18 +384,45 @@ for f in bands:
 positions = ["FL","FR","RL","RR","FC","LFE"]
 try:
     out = subprocess.check_output(["pw-dump"], text=True)
+    allowed = {"FL","FR","FC","LFE","RL","RR","SL","SR"}
+    canonical_51 = ["FL","FR","RL","RR","FC","LFE"]
+    candidates = []
     for obj in json.loads(out):
         props = obj.get("info", {}).get("props", {})
-        if props.get("node.name") == target:
-            raw = props.get("audio.position", "")
-            vals = [str(v) for v in raw] if isinstance(raw, list) else str(raw).strip().strip("[]").replace(",", " ").split()
-            allowed = {"FL","FR","FC","LFE","RL","RR","SL","SR"}
-            vals = [v.strip() for v in vals if v.strip() in allowed]
-            if 2 <= len(vals) <= 6:
-                positions = vals
-            break
+        if props.get("node.name") != target:
+            continue
+        raw = props.get("audio.position", "")
+        if isinstance(raw, list):
+            vals = [str(v).strip().strip('\"\'') for v in raw]
+        else:
+            vals = re.findall(r"\b(?:FL|FR|FC|LFE|RL|RR|SL|SR)\b", str(raw or ""))
+        vals = [v for v in vals if v in allowed]
+        try:
+            channels = int(str(props.get("audio.channels", "0")).strip('\"'))
+        except Exception:
+            channels = 0
+        score = (
+            1 if str(props.get("media.class", "")) == "Audio/Sink" else 0,
+            max(channels, len(vals)),
+            len(vals),
+        )
+        candidates.append((score, channels, vals))
+
+    if candidates:
+        _, channels, vals = max(candidates, key=lambda item: item[0])
+        if channels == 6 or (len(vals) == 6 and set(vals) == set(canonical_51)):
+            positions = canonical_51
+        elif 2 <= len(vals) <= 8:
+            positions = vals
+
+    # Never let a transient/stale stereo pw-dump object downgrade an actual
+    # 5.1 surround profile.  The EQ sink uses canonical semantic positions;
+    # PipeWire maps those labels onto the physical sink's hardware ordering.
+    if ("analog-surround-51" in target.lower() or "surround-51" in target.lower()):
+        positions = canonical_51
 except Exception:
-    pass
+    if "analog-surround-51" in target.lower() or "surround-51" in target.lower():
+        positions = ["FL","FR","RL","RR","FC","LFE"]
 
 nodes=[
     '          {\n            type = builtin\n            name = preamp\n            label = linear\n            control = { "Mult" = 1.00000000 "Add" = 0.0 }\n          }'
@@ -430,7 +536,7 @@ if parts <= (3,3,24):
         if key in cur:
             cur[key]=max(0.0,min(100.0,math.pow(10.0,float(cur[key])/60.0)*100.0))
 cur.setdefault('safe_headroom',True); cur.setdefault('auto_reconnect',True)
-data['version']='3.3.36'
+data['version']='3.3.38'
 tmp=p.with_name(p.name+'.install-tmp')
 tmp.write_text(json.dumps(data,indent=2))
 json.loads(tmp.read_text())
@@ -471,31 +577,49 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 if [[ $RESTART -eq 1 ]]; then
-  if [[ "$is_bazzite" -eq 1 ]]; then
-    echo "Starting the Sound Blaster EQ service…"
-    # Fedora 44 ships this unit with PipeWire. It runs pipewire using
-    # filter-chain.conf and therefore consumes ~/.config/pipewire/filter-chain.conf.d/.
-    if ! systemctl --user cat filter-chain.service >/dev/null 2>&1; then
-      echo "ERROR: PipeWire filter-chain.service is unavailable on this Bazzite deployment." >&2
+  echo "Starting/reloading the Sound Blaster EQ path…"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+  if systemctl --user cat filter-chain.service >/dev/null 2>&1; then
+    # Fedora, Arch/CachyOS and Bazzite can provide this user unit. Prefer it
+    # over restarting the entire desktop PipeWire stack. Enable when possible
+    # so the EQ client is present on the next login too.
+    systemctl --user enable filter-chain.service >/dev/null 2>&1 || true
+    if ! systemctl --user restart filter-chain.service; then
+      systemctl --user reset-failed filter-chain.service >/dev/null 2>&1 || true
+      if ! systemctl --user restart filter-chain.service; then
+        echo "ERROR: filter-chain.service could not be started." >&2
+        systemctl --user status filter-chain.service --no-pager >&2 || true
+        exit 1
+      fi
+    fi
+    # The unit is known to be loaded at this point; clear any stale failed state.
+    systemctl --user reset-failed filter-chain.service >/dev/null 2>&1 || true
+    if ! systemctl --user is-active --quiet filter-chain.service; then
+      echo "ERROR: filter-chain.service is not active after restart." >&2
+      systemctl --user status filter-chain.service --no-pager >&2 || true
       exit 1
     fi
-    systemctl --user enable --now filter-chain.service >/dev/null
-    systemctl --user restart filter-chain.service
   else
-    echo "Restarting the user PipeWire stack once…"
+    echo "No filter-chain.service user unit found; restarting the user PipeWire stack once…"
     systemctl --user restart pipewire pipewire-pulse wireplumber
   fi
+
   for _ in {1..40}; do
     pactl list short sinks 2>/dev/null | grep -qF "$TARGET" && pactl list short sinks 2>/dev/null | grep -q $'\tsoundblaster_zse_eq\t' && break
     sleep 0.5
   done
   if ! pactl list short sinks 2>/dev/null | grep -qF "$TARGET"; then
-    echo "ERROR: Hardware target did not return after PipeWire restart: $TARGET" >&2; exit 1
+    echo "ERROR: Hardware target did not return after audio reload: $TARGET" >&2; exit 1
   fi
   if ! pactl list short sinks 2>/dev/null | grep -q $'\tsoundblaster_zse_eq\t'; then
-    echo "ERROR: Sound Blaster EQ node did not load after PipeWire restart." >&2
-    echo "Check: journalctl --user -u pipewire -b --no-pager | tail -80" >&2; exit 1
+    echo "ERROR: Sound Blaster EQ node did not load after audio reload." >&2
+    echo "Check: systemctl --user status filter-chain.service --no-pager" >&2
+    echo "       journalctl --user -u filter-chain.service -b --no-pager | tail -80" >&2
+    exit 1
   fi
+  # Keep the user's verified physical fallback as default on smart-filter
+  # installs; Bazzite compatibility mode routes directly through the EQ sink.
   if [[ "$is_bazzite" -eq 1 ]]; then pactl set-default-sink soundblaster_zse_eq || true; else pactl set-default-sink "$TARGET" || true; fi
 fi
 

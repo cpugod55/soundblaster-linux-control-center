@@ -7,12 +7,16 @@ Sound Blaster Linux Control Center is now available for Linux community testing.
 - **Ubuntu 26.04.1 LTS**
 - **Bazzite / Fedora Atomic**
 
-### Community testing requested
-
-The following platforms have installer/support paths but have not yet been hardware-verified by the project maintainer:
+### Community-verified platforms
 
 - **Fedora Workstation**
-- **Arch-family distributions**
+- **Arch Linux**
+- **CachyOS (Arch family)** — Sound Blaster Z SE / CA0132 analog 5.1 routing verified by a community tester
+
+### Community testing requested
+
+The following platforms have installer/support paths but have not yet been hardware-verified by the project maintainer or community-verified:
+
 - **openSUSE**
 - **Debian-family distributions other than Ubuntu**
 
@@ -30,7 +34,13 @@ If Sound Blaster Linux Control Center is useful to you, you can support continue
 
 The repository includes a GitHub funding configuration so the **Sponsor** option can be displayed when GitHub Sponsors is enabled for the maintainer account.
 
-# Sound Blaster Linux Control Center 3.3.35
+# Sound Blaster Linux Control Center 3.3.38
+
+## 3.3.38 cross-distro installer and CA0132 routing fixes
+
+The installer now supplies the verified ZaMaxim LADSPA package names on Arch-family and Fedora-family systems, diagnoses root-owned PipeWire user configuration paths before writing, and starts/verifies `filter-chain.service` wherever the distro provides it. Quoted WirePlumber channel arrays are parsed correctly, preventing a valid 5.1 target from being regenerated as a 2.0 `soundblaster_zse_eq` sink.
+
+A community-verified CA0132 analog 5.1 hardware-port correction is available with `./install.sh --ca0132-channel-fix`. The option is deliberately opt-in while additional CA0132 machines are tested. The virtual EQ remains canonical `[ FL FR RL RR FC LFE ]`; the physical correction underneath is `[ FL FR FC LFE RL RR ]`.
 
 ## 3.3.24 REDIRECT level and LFE overload protection
 
@@ -233,8 +243,9 @@ Current testing status:
 
 - **Ubuntu:** hardware tested
 - **Bazzite / Fedora Atomic:** hardware tested
-- **Fedora Workstation:** community testing requested
-- **Arch-family distributions:** community testing requested
+- **Fedora Workstation:** community verified
+- **Arch Linux:** community verified
+- **CachyOS / Arch family:** community verified on Sound Blaster Z SE / CA0132 analog 5.1
 - **openSUSE:** community testing requested
 - **Debian-family distributions other than Ubuntu:** community testing requested
 

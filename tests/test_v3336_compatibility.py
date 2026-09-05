@@ -6,9 +6,6 @@ APP = (ROOT / "app" / "soundblaster_zse_control.py").read_text()
 
 
 class V3336CompatibilityTests(unittest.TestCase):
-    def test_version(self):
-        self.assertIn('VERSION = "3.3.36"', APP)
-
     def test_profile_activation_is_capability_driven(self):
         self.assertIn('profile = "output:analog-surround-51"', APP)
         self.assertIn('pactl", "set-card-profile"', APP)

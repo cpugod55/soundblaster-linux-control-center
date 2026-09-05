@@ -1,9 +1,16 @@
-## **3.3.36**
+## 3.3.38
 
-- Add capability-driven Sound Blaster analog 5.1 profile activation for compatible CA0132 devices.
-- Improve multichannel detection when PipeWire initially selects an analog stereo profile.
-- Add regression coverage for 5.1 profile activation and existing surround/AC3 sink preservation.
-- Add GitHub Sponsors funding configuration and project support information.
+- Fixes cross-distro LADSPA dependency installation: Arch/CachyOS now installs `zam-plugins-ladspa`; Fedora installs `ladspa-zam-plugins`; Bazzite/Fedora Atomic reports `ladspa-zam-plugins` as a required layered package when missing.
+- Replaces raw `PermissionError` failures on root-owned `~/.config/pipewire` paths with a targeted ownership diagnostic and exact repair command, while continuing to refuse running the user-local installer with sudo/root.
+- Makes `filter-chain.service` startup distro-neutral: daemon reload, start/restart, retry after `reset-failed`, active-state verification, and final `soundblaster_zse_eq` sink verification now work on Fedora, Arch/CachyOS, and Bazzite when the unit exists.
+- Fixes quoted WirePlumber `audio.position` parsing that could reject all six channel labels and silently regenerate `soundblaster_zse_eq` as stereo.
+- Canonicalizes a complete logical 5.1 virtual EQ layout to `[ FL FR RL RR FC LFE ]` while allowing a corrected physical sink to advertise its own port order underneath.
+- Adds an opt-in `--ca0132-channel-fix` installer switch for the community-verified Sound Blaster Z/CA0132 analog 5.1 physical map `[ FL FR FC LFE RL RR ]`; it remains opt-in until validated on more CA0132 systems.
+- Preserves the v3.3.36 capability-driven activation of an available Sound Blaster analog 5.1 profile before EQ channel discovery.
+
+## 3.3.36
+
+- Adds capability-driven activation of `output:analog-surround-51` when a selected CA0132/Sound Blaster sink is stereo but its card explicitly exposes an available analog 5.1 profile. Existing surround-51 and AC3 targets are left unchanged.
 
 ## 3.3.35
 

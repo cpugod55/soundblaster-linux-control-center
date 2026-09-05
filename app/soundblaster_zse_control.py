@@ -19,7 +19,7 @@ from tkinter import ttk, messagebox, simpledialog
 
 APP_NAME = "Sound Blaster Linux Control Center"
 APP_ID = "soundblaster-zse-control"
-VERSION = "3.3.36"
+VERSION = "3.3.38"
 SINK = "soundblaster_zse_eq"
 OUTPUT_NODE = "soundblaster_zse_eq_output"
 FILL_SINK = "soundblaster_zse_fill"
@@ -394,28 +394,93 @@ def activate_analog_surround51_profile(target_sink):
 
 
 def normalize_channel_positions(value):
-    """Return a PipeWire channel map like ["FL", "FR", ...] from pw-dump data."""
-    if isinstance(value, list):
-        vals = [str(v).strip() for v in value]
-    else:
-        text = str(value or "").strip().strip("[]")
-        vals = [v.strip().strip(',') for v in text.replace(',', ' ').split()]
+    """Return PipeWire channel positions robustly from list/string props.
+
+    WirePlumber/PipeWire may expose audio.position as a JSON list or as a
+    quoted string such as ``[ "FL", "FR", ... ]``.  Older parsing left
+    the quote characters attached, rejected every token, and silently fell
+    back to stereo.
+    """
     allowed = {"FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR"}
-    vals = [v for v in vals if v in allowed]
-    return vals
+    if isinstance(value, list):
+        vals = [str(v).strip().strip('\"\'') for v in value]
+    else:
+        vals = re.findall(r"\b(?:FL|FR|FC|LFE|RL|RR|SL|SR)\b", str(value or ""))
+    return [v for v in vals if v in allowed]
+
+
+def _best_pw_dump_sink_layout(dump_objects, name):
+    """Return the best channel layout for *name* from a pw-dump snapshot.
+
+    PipeWire can expose more than one object carrying the same node.name while
+    a filter graph is being rebuilt.  Do not accept the first matching object:
+    prefer a real Audio/Sink object and the candidate with the largest valid
+    channel count/layout.  This prevents a transient/stale stereo object from
+    downgrading a real 5.1 hardware sink during config generation.
+    """
+    candidates = []
+    for obj in dump_objects:
+        props = obj.get("info", {}).get("props", {})
+        if props.get("node.name") != name:
+            continue
+        vals = normalize_channel_positions(props.get("audio.position"))
+        try:
+            channels = int(str(props.get("audio.channels", "0")).strip('"'))
+        except Exception:
+            channels = 0
+        media_class = str(props.get("media.class", ""))
+        score = (
+            1 if media_class == "Audio/Sink" else 0,
+            max(channels, len(vals)),
+            len(vals),
+        )
+        candidates.append((score, channels, vals))
+
+    if not candidates:
+        return []
+
+    _, channels, vals = max(candidates, key=lambda item: item[0])
+    canonical_51 = ["FL", "FR", "RL", "RR", "FC", "LFE"]
+    if channels == 6 or (len(vals) == 6 and set(vals) == set(canonical_51)):
+        return canonical_51
+    if 2 <= len(vals) <= 8:
+        return vals
+    return []
 
 
 def sink_channel_positions(name):
-    result=run(["pw-dump"],capture=True)
-    if result.returncode==0:
+    result = run(["pw-dump"], capture=True)
+    if result.returncode == 0:
         try:
-            for obj in json.loads(result.stdout):
-                props=obj.get("info",{}).get("props",{})
-                if props.get("node.name")==name:
-                    vals=normalize_channel_positions(props.get("audio.position"))
-                    if 2 <= len(vals) <= 6: return vals
-        except Exception: pass
-    return ["FL","FR"]
+            vals = _best_pw_dump_sink_layout(json.loads(result.stdout), name)
+            if vals:
+                return vals
+        except Exception:
+            pass
+
+    # A surround profile is unambiguously multichannel even if pw-dump is
+    # briefly incomplete during a WirePlumber/PipeWire restart.  The virtual
+    # EQ exposes canonical semantic positions; PipeWire maps them to the
+    # physical sink's corrected hardware order.
+    lowered = str(name or "").lower()
+    if "analog-surround-51" in lowered or "surround-51" in lowered:
+        return ["FL", "FR", "RL", "RR", "FC", "LFE"]
+    return ["FL", "FR"]
+
+
+def filter_channel_positions(target_sink):
+    """Return the logical layout exposed by our virtual EQ sink.
+
+    A physical CA0132 sink may intentionally advertise a non-canonical port
+    order after a WirePlumber hardware-map correction.  The virtual EQ should
+    still expose the canonical logical 5.1 order; PipeWire then maps those
+    semantic channel labels to the target sink's corrected physical ports.
+    """
+    positions = sink_channel_positions(target_sink)
+    canonical_51 = ["FL", "FR", "RL", "RR", "FC", "LFE"]
+    if len(positions) == 6 and set(positions) == set(canonical_51):
+        return canonical_51
+    return positions
 
 def channel_key_for_position(pos):
     return {"FL":"fl","FR":"fr","FC":"fc","LFE":"lfe","RL":"rl","RR":"rr","SL":"rl","SR":"rr"}.get(pos)
@@ -513,7 +578,7 @@ def eq_config_text(target_sink, gains=None, positions=None, preamp_db=0.0, setti
     if compatibility is None:
         compatibility = is_bazzite()
     gains = gains or {f: 0.0 for f in BANDS}
-    positions = positions or sink_channel_positions(target_sink)
+    positions = positions or filter_channel_positions(target_sink)
     channel_count = len(positions)
     position_text = " ".join(positions)
     explicit_bass = not compatibility and positions == ["FL", "FR", "RL", "RR", "FC", "LFE"]
@@ -642,6 +707,51 @@ def parse_eq_config():
     return gains, target
 
 
+def ensure_user_writable_config_dir(path):
+    """Create a user config directory or raise a targeted ownership error."""
+    directory = Path(path)
+    existing = directory
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if existing.exists() and not os.access(existing, os.W_OK | os.X_OK):
+        raise RuntimeError(
+            f"Cannot write to {directory}. Existing path {existing} is not writable by {os.environ.get('USER', 'the current user')}. "
+            f"Repair ownership with: sudo chown -R \"$(id -un):$(id -gn)\" \"{CONFIG_HOME / 'pipewire'}\""
+        )
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Cannot create {directory}. PipeWire user configuration appears to have incorrect ownership. "
+            f"Repair it with: sudo chown -R \"$(id -un):$(id -gn)\" \"{CONFIG_HOME / 'pipewire'}\""
+        ) from exc
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise RuntimeError(
+            f"{directory} exists but is not writable. Repair ownership with: "
+            f"sudo chown -R \"$(id -un):$(id -gn)\" \"{CONFIG_HOME / 'pipewire'}\""
+        )
+
+
+def user_unit_available(unit):
+    return run(["systemctl", "--user", "cat", unit], capture=True).returncode == 0
+
+
+def restart_filter_chain_service():
+    """Start/restart the distro-provided PipeWire filter-chain user service."""
+    if not user_unit_available("filter-chain.service"):
+        return False
+    run(["systemctl", "--user", "daemon-reload"], capture=True)
+    result = run(["systemctl", "--user", "restart", "filter-chain.service"], capture=True)
+    if result.returncode != 0:
+        # Only reset once the unit is known to be loaded, then retry.
+        run(["systemctl", "--user", "reset-failed", "filter-chain.service"], capture=True)
+        result = run(["systemctl", "--user", "restart", "filter-chain.service"], capture=True)
+    if result.returncode != 0:
+        raise RuntimeError("Sound Blaster EQ service restart failed: " + (result.stderr.strip() or "unknown error"))
+    run(["systemctl", "--user", "reset-failed", "filter-chain.service"], capture=True)
+    return True
+
+
 def ensure_configs(data, force=False):
     gains, existing_target = parse_eq_config()
     target = data["current"].get("hardware_sink") or existing_target or detect_hardware_sink()
@@ -654,8 +764,8 @@ def ensure_configs(data, force=False):
     target = activate_analog_surround51_profile(target)
     target = detect_hardware_sink() or target
     data["current"]["hardware_sink"] = target
-    EQ_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    FILL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    ensure_user_writable_config_dir(EQ_CONFIG.parent)
+    ensure_user_writable_config_dir(FILL_CONFIG.parent)
     if force or not EQ_CONFIG.exists():
         EQ_CONFIG.write_text(eq_config_text(target, gains, preamp_db=effective_preamp_db(data["current"]), settings=data["current"]))
     if force or not FILL_CONFIG.exists():
@@ -664,14 +774,11 @@ def ensure_configs(data, force=False):
 
 
 def restart_audio(target=None):
-    # Fedora/Bazzite ships filter-chain.service, which runs `pipewire -c
-    # filter-chain.conf`. Restart only that EQ client when changing EQ config;
-    # do not churn the entire desktop audio stack every 30 seconds.
-    if is_bazzite():
-        result = run(["systemctl", "--user", "restart", "filter-chain.service"], capture=True)
-        if result.returncode != 0:
-            raise RuntimeError("Sound Blaster EQ service restart failed: " + (result.stderr.strip() or "unknown error"))
-    else:
+    # Prefer the distro-provided filter-chain client wherever it exists. This
+    # is verified on Fedora, Arch/CachyOS and Bazzite and avoids needlessly
+    # restarting the full desktop audio stack.
+    used_filter_service = restart_filter_chain_service()
+    if not used_filter_service:
         result = run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"], capture=True)
         if result.returncode != 0:
             raise RuntimeError("PipeWire restart command failed: " + (result.stderr.strip() or "unknown error"))
@@ -679,7 +786,8 @@ def restart_audio(target=None):
         raise RuntimeError(f"Hardware target '{target}' is unavailable after audio reload")
     if not wait_for_sink(SINK, 20):
         raise RuntimeError(f"Hardware audio is available, but the Sound Blaster EQ node '{SINK}' did not load")
-    set_default_sink(target)
+    if target and sink_exists(target):
+        set_default_sink(target)
 
 
 def get_filter_node_id():
@@ -1102,6 +1210,11 @@ def restore_at_login(data):
         ensure_configs(data)
     except Exception as exc:
         restore_log(f"ensure_configs warning: {exc}")
+    if not sink_exists(SINK):
+        try:
+            restart_filter_chain_service()
+        except Exception as exc:
+            restore_log(f"filter-chain startup warning: {exc}")
     if not wait_for_sink(SINK, 20):
         restore_log(f"startup restore FAILED: {SINK} did not appear")
         return False
@@ -1122,7 +1235,7 @@ def configure_target(data, target):
         raise RuntimeError("Choose a physical hardware sink, not the Sound Blaster EQ virtual sink")
     gains, _ = parse_eq_config()
     data["current"]["hardware_sink"] = target
-    EQ_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    ensure_user_writable_config_dir(EQ_CONFIG.parent)
     EQ_CONFIG.write_text(eq_config_text(target, gains, preamp_db=effective_preamp_db(data["current"]), settings=data["current"]))
     save_data(data)
 
@@ -2196,18 +2309,9 @@ def reconnect_now(silent=False):
     try:
         ensure_configs(DATA)
         target = DATA["current"].get("hardware_sink")
-        if is_bazzite():
-            if target and not sink_exists(target):
-                raise RuntimeError(f"AC3 5.1 fallback target '{target}' is unavailable")
-            result = run(["systemctl", "--user", "restart", "filter-chain.service"], capture=True)
-            if result.returncode != 0:
-                raise RuntimeError("EQ service retry failed: " + (result.stderr.strip() or "unknown error"))
-            if not wait_for_sink(SINK, 8):
-                raise RuntimeError("EQ service did not create the Sound Blaster EQ node; AC3 5.1 fallback remains active")
-            if target and sink_exists(target):
-                set_default_sink(target)
-        else:
-            restart_audio(target)
+        if target and not sink_exists(target):
+            raise RuntimeError(f"Hardware fallback target '{target}' is unavailable")
+        restart_audio(target)
         apply_channel_levels(gui_settings(), bypass_var.get())
         apply_all_live_eq()
         if not silent:
@@ -3297,7 +3401,7 @@ ttk.Label(about_box,text=f"Detected layout: {ACTIVE_LAYOUT}\nChannels: {' '.join
 contact_frame=ttk.Frame(about_box,style="Card.TFrame")
 contact_frame.pack(fill="x",pady=(14,0))
 ttk.Label(contact_frame,text="Created by !!ZuEs!!",style="Card.TLabel",font=("Arial",11,"bold")).pack(anchor="w")
-ttk.Label(contact_frame,text="Contact: GitHub Issues",style="Muted.TLabel").pack(anchor="w",pady=(2,0))
+ttk.Label(contact_frame,text="Contact: zuestgg@gmail.com",style="Muted.TLabel").pack(anchor="w",pady=(2,0))
 if SIGNATURE_IMAGE.exists():
     try:
         dev_sig=tk.PhotoImage(file=str(SIGNATURE_IMAGE)); dev_sig_lbl=tk.Label(about_box,image=dev_sig,bg=CARD,borderwidth=0); dev_sig_lbl.image=dev_sig; dev_sig_lbl.pack(anchor="e",pady=(10,0))
