@@ -10,10 +10,11 @@ class V3331RegressionTests(unittest.TestCase):
         cls.text = APP.read_text()
 
     def test_version(self):
-        self.assertIn('VERSION = "3.3.38"', self.text)
+        self.assertIn('VERSION = "3.3.7"', self.text)
 
     def test_meter_uses_explicit_pipewire_links(self):
-        self.assertIn('["pw-record", "--raw", "--target=0"', self.text)
+        self.assertIn('cmd = ["pw-record"]', self.text)
+        self.assertIn('pw_record_supports_raw()', self.text)
         self.assertIn('f"{hardware_sink}:monitor_{pos}"', self.text)
         self.assertIn('f"{node_name}:input_MONO"', self.text)
         self.assertIn('run(["pw-link", output_port, input_port]', self.text)

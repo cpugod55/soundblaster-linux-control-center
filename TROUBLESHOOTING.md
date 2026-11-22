@@ -175,7 +175,7 @@ pactl list short sources
 
 Also state the Linux distribution/version, desktop environment, Sound Blaster model, connection type (analog or optical), and what you expected versus what happened. Avoid posting unrelated private system information.
 
-Contact: **!!ZuEs!! — GitHub Issues**
+Contact: **!!ZuEs!! — zuestgg@gmail.com**
 
 ## Bazzite: JamesDSP or stale `jamesdsp_sink` routing
 

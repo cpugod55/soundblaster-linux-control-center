@@ -11,8 +11,8 @@ APP = APP_PATH.read_text()
 
 class V3337CrossDistroTests(unittest.TestCase):
     def test_version_bumped(self):
-        self.assertIn('VERSION = "3.3.38"', APP)
-        self.assertIn('VERSION="3.3.38"', INSTALL)
+        self.assertIn('VERSION = "3.3.7"', APP)
+        self.assertIn('VERSION="3.3.7"', INSTALL)
 
     def test_channel_position_parser_accepts_quoted_wireplumber_string(self):
         # Extract the function without importing the GUI module.

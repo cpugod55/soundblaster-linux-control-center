@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-python3 -m py_compile "$HERE/app/soundblaster_zse_control.py"
+python3 -m py_compile "$HERE/app/soundblaster_zse_control.py" "$HERE/app/audio_return_helper.py"
 python3 -m unittest discover -s "$HERE/tests" -p 'test_*.py'
 bash -n "$HERE/install.sh"
 bash -n "$HERE/uninstall.sh"

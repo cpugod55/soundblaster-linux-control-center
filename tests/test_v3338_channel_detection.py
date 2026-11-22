@@ -15,8 +15,8 @@ class V3338ChannelDetectionTests(unittest.TestCase):
         return ns
 
     def test_version_bumped(self):
-        self.assertIn('VERSION = "3.3.38"', APP)
-        self.assertIn('VERSION="3.3.38"', INSTALL)
+        self.assertIn('VERSION = "3.3.7"', APP)
+        self.assertIn('VERSION="3.3.7"', INSTALL)
 
     def test_literal_jameyr_quoted_layout_parses(self):
         ns = self._load_helpers()

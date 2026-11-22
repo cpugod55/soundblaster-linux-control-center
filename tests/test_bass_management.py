@@ -85,8 +85,10 @@ class BassManagementTests(unittest.TestCase):
         gains = {f: 0.0 for f in self.ns["BANDS"]}
         ubuntu = self.ns["eq_config_text"]("target", gains, ["FL","FR","RL","RR","FC","LFE"],
             0.0, self.base, compatibility=False)
+        self.ns["is_bazzite"] = lambda: True
         bazzite = self.ns["eq_config_text"]("target", gains, ["FL","FR","RL","RR","FC","LFE"],
             0.0, self.base, compatibility=True)
+        self.ns["is_bazzite"] = lambda: False
         self.assertIn('input = "lfe_sum:In 6"', ubuntu)
         self.assertIn('outputs = [ "main_select_FL:Out"', ubuntu)
         self.assertIn("name = native_lfe_trim", ubuntu)

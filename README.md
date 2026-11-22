@@ -1,32 +1,21 @@
-## Community testing
+# Sound Blaster Linux Control Center v3.3.7 — Community Testing Pre-release
 
-Sound Blaster Linux Control Center is now available for Linux community testing.
+**v3.3.7 is the public-facing name of the hardware-tested v3.3.68-test4 checkpoint.** The name is intentional; it is not an older codebase. This is a **pre-release**, not a fully cross-distribution-verified stable release.
 
-### Hardware-tested platforms
+**Verified:** Ubuntu 26.04 KDE on a Sound Blaster Z-series CA0132 using digital AC3 5.1 and an external surround speaker system. Automatic switching to a headset and back restores 5.1 and EQ with the GUI closed, after roughly 1–2 seconds, in the maintainer's hardware test.
 
-- **Ubuntu 26.04.1 LTS**
-- **Bazzite / Fedora Atomic**
+**Not yet validated:** this exact build on Fedora, Bazzite, CachyOS, Mint, Debian, and openSUSE or on every supported Creative model. Device detection and capabilities differ; analog layouts above 2.1 are **EXPERIMENTAL**, and CA0132 analog multichannel routing may be unreliable.
 
-### Community-verified platforms
+**Install (from extracted archive, as the desktop user, without sudo):**
 
-- **Fedora Workstation**
-- **Arch Linux**
-- **CachyOS (Arch family)** — Sound Blaster Z SE / CA0132 analog 5.1 routing verified by a community tester
+```bash
+./verify_package.sh
+./install.sh
+```
 
-### Community testing requested
+**Rollback:** stop the optional background helper with `systemctl --user disable --now soundblaster-zse-audio-return.service`, then reinstall your previously working SBLCC release. Read `RELEASE_NOTES_v3.3.7.md` before upgrading.
 
-The following platforms have installer/support paths but have not yet been hardware-verified by the project maintainer or community-verified:
-
-- **openSUSE**
-- **Debian-family distributions other than Ubuntu**
-
-If you test the application on one of these platforms, please report your results through **GitHub Issues**. Successful installation and successful testing are both valuable feedback.
-
-When reporting a problem, please include your Linux distribution/version, Sound Blaster model, PipeWire version, WirePlumber version, and the relevant details of what happened.
-
-The repository includes a privacy-conscious `collect_diagnostics.sh` utility that can collect useful audio-stack information for bug reports.
-
-**This project does not consider a distribution hardware-verified simply because the installer detects it. Hardware verification requires an actual test on that platform.**
+---
 
 ## Support the project
 
@@ -34,11 +23,25 @@ If Sound Blaster Linux Control Center is useful to you, you can support continue
 
 The repository includes a GitHub funding configuration so the **Sponsor** option can be displayed when GitHub Sponsors is enabled for the maintainer account.
 
-# Sound Blaster Linux Control Center 3.3.38
+# Sound Blaster Linux Control Center 3.3.53
 
-## 3.3.38 cross-distro installer and CA0132 routing fixes
+## 3.3.53 current test build
 
-The installer now supplies the verified ZaMaxim LADSPA package names on Arch-family and Fedora-family systems, diagnoses root-owned PipeWire user configuration paths before writing, and starts/verifies `filter-chain.service` wherever the distro provides it. Quoted WirePlumber channel arrays are parsed correctly, preventing a valid 5.1 target from being regenerated as a 2.0 `soundblaster_zse_eq` sink.
+
+openSUSE Tumbleweed test focus: add native `zypper` dependency handling and a persistent Creative Digital A52 fallback using openSUSE's verified `plug:a52:<card>` PCM. The installer enables the Creative `IEC958` and `IEC958 Default PCM` playback switches when exposed. `aplay -L` enumeration is not required for this path.
+
+Debian clean-Live handling now starts the user PipeWire/WirePlumber/PipeWire-Pulse stack before hardware detection when `pactl` cannot connect, reports a clear error instead of silently exiting under `set -e`, and deduplicates repeated package names.
+
+Ubuntu test focus: use the v3.3.51 explicit Speaker Fill DSP on native Creative AC3 5.1 without changing the established Ubuntu EQ target path.
+
+Linux Mint / non-Atomic A52 Digital 5.1 now uses an explicit application-owned stereo-to-5.1 PipeWire filter graph for Speaker Fill instead of relying on PipeWire channelmix. The graph owns OFF/PSD/FULL, rear delay, stereo width, Center synthesis, and Speaker Fill LFE low-pass while preserving canonical `FL FR RL RR FC LFE` channel identity into the main EQ. Bazzite keeps its previously verified compatibility path.
+
+The interface also adopts the same visual family direction as AMD Linux Control Center: darker neutral cards, red accent controls, and a dashboard-style connection/version header.
+
+
+## 3.3.39 stale-target 5.1 upgrade fix
+
+3.3.39 keeps the verified 3.3.38 cross-distro and CA0132 fixes and closes one remaining upgrade-path hole: if an older EQ graph preserved an `analog-stereo` target while the exact same device is currently exposing a live `analog-surround-51` sink, installation/config regeneration now follows that live 5.1 sibling instead of recreating a 2-channel `soundblaster_zse_eq` sink.
 
 A community-verified CA0132 analog 5.1 hardware-port correction is available with `./install.sh --ca0132-channel-fix`. The option is deliberately opt-in while additional CA0132 machines are tested. The virtual EQ remains canonical `[ FL FR RL RR FC LFE ]`; the physical correction underneath is `[ FL FR FC LFE RL RR ]`.
 
@@ -239,34 +242,22 @@ The Line Input tab can create an optional **Sound Blaster Processed Mic** source
 
 ## 3.3.0 distribution support
 
-Current testing status:
-
-- **Ubuntu:** hardware tested
-- **Bazzite / Fedora Atomic:** hardware tested
-- **Fedora Workstation:** community verified
-- **Arch Linux:** community verified
-- **CachyOS / Arch family:** community verified on Sound Blaster Z SE / CA0132 analog 5.1
-- **openSUSE:** community testing requested
-- **Debian-family distributions other than Ubuntu:** community testing requested
-
-The installer contains distro-detection and dependency-handling paths for Debian/Ubuntu-family, Fedora, Arch-family, Bazzite/Fedora Atomic, and openSUSE systems. Detection support does not mean every listed distribution has been hardware verified.
-
-On supported mutable distributions, the installer attempts to install only missing dependencies. On Bazzite/Fedora Atomic it does not automatically layer packages; if a required host audio component is missing, it prints the required rpm-ostree command and exits so the user can make that system-level change explicitly.
+The installer detects Debian/Ubuntu-family, Fedora, Arch-family, and Bazzite/Fedora Atomic systems. It installs only missing dependencies on mutable distributions. On Bazzite/Atomic it does not automatically layer packages; if a required host audio component is missing it prints the required rpm-ostree command and exits so the user can make that system-level change explicitly.
 
 
 ## Privacy / portability audit
 
 The distributable package contains no developer username, home directory, hostname, fixed PCI address, fixed ALSA card number, Arctis/SteelSeries device identifier, or session-specific PipeWire numeric node ID. Runtime device names and paths are detected on the installed system. Legacy `z5500` filenames are referenced only for migration/removal of older releases.
 
-Project signature/contact: **!!ZuEs!!** — GitHub Issues
+Project signature/contact: **!!ZuEs!!** — `zuestgg@gmail.com`
 
 ## Quick start
 
 For most users:
 
 ```bash
-tar -xzf soundblaster-linux-control-center-3.3.38.tar.gz
-cd soundblaster-linux-control-center-3.3.38
+tar -xzf soundblaster-linux-control-center-3.3.39.tar.gz
+cd soundblaster-linux-control-center-3.3.39
 ./install.sh
 ```
 
@@ -291,3 +282,22 @@ If automatic detection chooses the wrong output, reinstall/select it explicitly:
 ```
 
 See **TROUBLESHOOTING.md** for common audio, 5.1, microphone, analyzer, and installation problems.
+
+
+### Analog multichannel status (v3.3.68-test1)
+Analog 2.0/2.1 is the conservative baseline. Analog 4.0, 4.1, 5.0 and 5.1 are **EXPERIMENTAL** and may not produce independent outputs on every CA0132 card or Linux kernel/driver. Digital AC3 5.1 is a separate, verified path on supported hardware.
+
+### Audio-device selection
+Linux/PipeWire/WirePlumber should choose active audio devices. SBLCC does not have headset-brand dependencies. The optional **Use Sound Blaster** button deliberately makes the SBLCC virtual EQ default and moves currently playing streams once; it does not prevent later user/device-driven selection.
+
+### Background audio return (v3.3.68-test4)
+
+An optional user-level systemd observer monitors changes to the system default
+output. It does **not** select Sound Blaster over a headset. Only after the
+system selects the configured Sound Blaster does it attempt to recover the
+saved surround profile and EQ without the GUI open. It is independent of headset
+brands and uses standard PipeWire/pactl APIs. The systemd user service is
+`soundblaster-zse-audio-return.service`. If desired, disable with
+`systemctl --user disable --now soundblaster-zse-audio-return.service`.
+
+This is experimental and has not yet been verified on all distros.

@@ -13,13 +13,14 @@ import signal
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
 APP_NAME = "Sound Blaster Linux Control Center"
 APP_ID = "soundblaster-zse-control"
-VERSION = "3.3.38"
+VERSION = "3.3.7"
 SINK = "soundblaster_zse_eq"
 OUTPUT_NODE = "soundblaster_zse_eq_output"
 FILL_SINK = "soundblaster_zse_fill"
@@ -33,6 +34,7 @@ STATE_FILE = STATE_DIR / "state.json"
 RESTORE_LOG = STATE_DIR / "restore.log"
 EQ_CONFIG = CONFIG_HOME / "pipewire/filter-chain.conf.d/soundblaster-zse-eq.conf"
 FILL_CONFIG = CONFIG_HOME / "pipewire/pipewire-pulse.conf.d/10-speaker-fill.conf"
+FILL_DSP_CONFIG = CONFIG_HOME / "pipewire/filter-chain.conf.d/soundblaster-zse-fill-dsp.conf"
 MIC_CONFIG = CONFIG_HOME / "pipewire/filter-chain.conf.d/soundblaster-mic-processing.conf"
 MIC_SOURCE = "soundblaster_processed_mic"
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/{os.getuid()}"))
@@ -65,6 +67,9 @@ DEFAULT_CURRENT = {
     "safe_headroom": True,
     "auto_reconnect": False,
     "hardware_sink": "",
+    "output_connection": "auto",
+    "speaker_layout": "auto",
+    "fill_engine": "application",
     "last_preset": "Current",
     "input_level": 100.0,
     "mic_boost_db": 0.0,
@@ -213,6 +218,15 @@ def wait_for_sink(name=SINK, timeout=12):
     return False
 
 
+def wait_for_sink_gone(name, timeout=2.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if not sink_exists(name):
+            return True
+        time.sleep(0.05)
+    return not sink_exists(name)
+
+
 def default_sink_name():
     result = run(["pactl", "get-default-sink"], capture=True)
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -258,6 +272,51 @@ def activate_eq_route(move_existing=True):
     if move_existing:
         move_playback_streams(SINK)
     return default_sink_name() == SINK
+
+
+def soundblaster_default_selected(default_name=None, hardware_name=None):
+    """True only if OS currently selected this configured Sound Blaster route.
+
+    Never interpret a USB/Bluetooth/HDMI or other user's default output as
+    permission to redirect playback streams. The EQ and Fill sinks are app-owned.
+    """
+    current = default_sink_name() if default_name is None else str(default_name)
+    saved = (DATA.get("current", {}).get("hardware_sink", "")
+             if hardware_name is None and "DATA" in globals() else (hardware_name or ""))
+    if current in (SINK, FILL_SINK):
+        return True
+    if not saved or not current or saved == current:
+        return bool(saved and saved == current)
+    # Different profiles can have different node suffixes; require the exact
+    # same ALSA hardware prefix, and never match a different sound device.
+    if not saved.startswith("alsa_output.") or not current.startswith("alsa_output."):
+        return False
+    def prefix(name):
+        return name.rsplit(".", 1)[0] if "." in name else name
+    return prefix(saved) == prefix(current)
+
+
+def select_soundblaster_explicitly(move_existing=True):
+    """Manual fail-safe. Never called automatically when another device is selected."""
+    if not sink_exists(SINK):
+        return False, "Sound Blaster EQ is unavailable; use Reconnect EQ first"
+    if not sink_exists(DATA.get("current", {}).get("hardware_sink", "")):
+        return False, "Saved Sound Blaster hardware output is unavailable"
+    result = run(["pactl", "set-default-sink", SINK], capture=True)
+    if result.returncode != 0 or default_sink_name() != SINK:
+        return False, "Could not select Sound Blaster EQ"
+    moved = 0
+    if move_existing:
+        # Exclude our own output adapter(s) to avoid an audio feedback loop.
+        for stream in playback_sink_inputs():
+            if stream["node"] in (OUTPUT_NODE, FILL_OUTPUT_NODE, FILL_LOOP_NAME):
+                continue
+            if stream["sink"] == SINK:
+                continue
+            result = run(["pactl", "move-sink-input", str(stream["id"]), SINK], capture=True)
+            if result.returncode == 0:
+                moved += 1
+    return True, f"Sound Blaster selected • {moved} active stream(s) moved"
 
 
 def activate_hardware_fallback():
@@ -361,6 +420,22 @@ def _pactl_surround51_sink_for_card(card_index):
         if card and name and int(card.group(1)) == int(card_index) and "surround-51" in name.group(1):
             return name.group(1)
     return ""
+
+
+def resolve_live_surround_sibling(target_sink):
+    """Replace a stale analog-stereo target with its currently live 5.1 sibling.
+
+    Upgrade/install paths can preserve a node name from an older filter graph.
+    If the card has since switched profiles, that saved analog-stereo node no
+    longer exists while the same device's analog-surround-51 node is live.
+    Prefer only that exact live sibling; do not broaden this into a generic
+    stereo-to-surround conversion.
+    """
+    target = str(target_sink or "")
+    if "analog-stereo" not in target.lower():
+        return target
+    sibling = re.sub(r"analog-stereo", "analog-surround-51", target, flags=re.IGNORECASE)
+    return sibling if sibling != target and sink_exists(sibling) else target
 
 
 def activate_analog_surround51_profile(target_sink):
@@ -485,9 +560,25 @@ def filter_channel_positions(target_sink):
 def channel_key_for_position(pos):
     return {"FL":"fl","FR":"fr","FC":"fc","LFE":"lfe","RL":"rl","RR":"rr","SL":"rl","SR":"rr"}.get(pos)
 
+LAYOUT_POSITIONS = {
+    "stereo": ["FL", "FR"],
+    "2.0": ["FL", "FR"],
+    "2.1": ["FL", "FR", "LFE"],
+    "4.0": ["FL", "FR", "RL", "RR"],
+    "4.1": ["FL", "FR", "RL", "RR", "LFE"],
+    "5.0": ["FL", "FR", "RL", "RR", "FC"],
+    "5.1": ["FL", "FR", "RL", "RR", "FC", "LFE"],
+}
+
+
+def requested_layout_positions(layout):
+    """Return canonical logical positions for an explicit Speaker Setup layout."""
+    return list(LAYOUT_POSITIONS.get(str(layout or "").lower(), []))
+
+
 def layout_name(pos):
-    n=len(pos); lfe="LFE" in pos
-    return "2.0" if n==2 else "2.1" if n==3 and lfe else "4.0" if n==4 else "4.1" if n==5 and lfe else "5.1" if n==6 else f"{n}-channel"
+    n=len(pos); lfe="LFE" in pos; center="FC" in pos
+    return "2.0" if n==2 else "2.1" if n==3 and lfe else "4.0" if n==4 else "4.1" if n==5 and lfe else "5.0" if n==5 and center else "5.1" if n==6 else f"{n}-channel"
 
 def is_bazzite():
     try:
@@ -495,6 +586,256 @@ def is_bazzite():
         return "bazzite" in text
     except Exception:
         return False
+
+
+_PIPEWIRE_VERSION_CACHE = False
+
+def pipewire_version_tuple():
+    """Return the installed PipeWire tool version as (major, minor, patch)."""
+    global _PIPEWIRE_VERSION_CACHE
+    if _PIPEWIRE_VERSION_CACHE is not False:
+        return _PIPEWIRE_VERSION_CACHE
+    result = run(["pipewire", "--version"], capture=True)
+    text = ((result.stdout or "") + "\n" + (result.stderr or "")) if result else ""
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", text)
+    _PIPEWIRE_VERSION_CACHE = tuple(map(int, match.groups())) if match else None
+    return _PIPEWIRE_VERSION_CACHE
+
+def fill_live_channelmix_needs_recreate():
+    """Use creation-time Fill DSP on older PipeWire that ignores live channelmix audibly."""
+    version = pipewire_version_tuple()
+    return version is not None and version < (1, 2, 0)
+
+
+def uses_dedicated_fill_route(settings=None):
+    """Use the stable stereo fill sink where Pulse restarts are unsafe.
+
+    Bazzite already uses this path.  Arch/CachyOS Digital 5.1 also needs it
+    because the A52 sink is a PipeWire-Pulse module backed by the exclusive
+    Creative IEC958 device; restarting pipewire-pulse tears down that sink and
+    can strand active application streams until the desktop reselects output.
+    """
+    if is_bazzite():
+        return True
+    current = settings if isinstance(settings, dict) else {}
+    if not current:
+        try:
+            current = DATA.get("current", {})
+        except Exception:
+            current = {}
+    return current.get("hardware_sink", "") == "alsa_output.soundblaster_a52_51"
+
+
+
+def uses_explicit_fill_dsp(settings=None):
+    """Choose the deterministic application-owned 2->5.1 Speaker Fill graph.
+
+    v3.3.63 exposes the engine choice.  Application Fill is preferred for
+    normal six-channel Creative analog/digital targets; PipeWire remains a
+    compatibility option.  Bazzite keeps its verified compatibility route
+    when the choice is automatic.
+    """
+    current = settings if isinstance(settings, dict) else {}
+    if not current:
+        try:
+            current = DATA.get("current", {})
+        except Exception:
+            current = {}
+    engine = str(current.get("fill_engine", "application")).lower()
+    if engine == "pipewire":
+        return False
+    logical = requested_layout_positions(current.get("speaker_layout"))
+    if logical and logical != LAYOUT_POSITIONS["5.1"]:
+        return False
+    target = str(current.get("hardware_sink", ""))
+    if engine == "application":
+        return ("surround-51" in target.lower() or target == "alsa_output.soundblaster_a52_51")
+    if is_bazzite():
+        return False
+    return target == "alsa_output.soundblaster_a52_51" or "iec958-ac3-surround-51" in target
+
+
+def uses_stable_fill_route(settings=None):
+    """Route stereo apps through the persistent Fill sink without changing EQ targeting."""
+    return uses_dedicated_fill_route(settings) or uses_explicit_fill_dsp(settings)
+
+
+def fill_dsp_controls(settings):
+    """Return deterministic controls for the explicit stereo-to-5.1 graph."""
+    mode = str(settings.get("fill_mode", "PSD")).upper()
+    width = max(0.0, min(1.0, float(settings.get("stereo_width", 0.0))))
+    delay_s = max(0.0, min(0.05, float(settings.get("rear_delay", 12.0)) / 1000.0))
+    cutoff = max(40.0, min(250.0, float(settings.get("lfe_cutoff", 150))))
+    on = mode != "OFF"
+    controls = {
+        "front_l:Gain 1": 1.0,
+        "front_l:Gain 2": -0.25 * width,
+        "front_r:Gain 1": -0.25 * width,
+        "front_r:Gain 2": 1.0,
+        "center:Gain 1": 0.5 if on else 0.0,
+        "center:Gain 2": 0.5 if on else 0.0,
+        "lfe_sum:Gain 1": 0.5 if on else 0.0,
+        "lfe_sum:Gain 2": 0.5 if on else 0.0,
+        "lfe_lp:Freq": cutoff,
+        "lfe_lp:Q": 0.70710678,
+        "rear_delay_l:Delay (s)": delay_s,
+        "rear_delay_r:Delay (s)": delay_s,
+    }
+    if mode == "FULL":
+        controls.update({
+            "rear_l:Gain 1": 0.75, "rear_l:Gain 2": 0.0,
+            "rear_r:Gain 1": 0.0, "rear_r:Gain 2": 0.75,
+        })
+    elif mode == "PSD":
+        controls.update({
+            "rear_l:Gain 1": 0.50, "rear_l:Gain 2": -0.50,
+            "rear_r:Gain 1": -0.50, "rear_r:Gain 2": 0.50,
+        })
+    else:
+        controls.update({
+            "rear_l:Gain 1": 0.0, "rear_l:Gain 2": 0.0,
+            "rear_r:Gain 1": 0.0, "rear_r:Gain 2": 0.0,
+        })
+    return controls
+
+
+def fill_dsp_config_text(settings):
+    """Build a dedicated PipeWire filter-chain stereo Speaker Fill sink."""
+    c = fill_dsp_controls(settings)
+    def v(name):
+        return float(c[name])
+    return f"""# Sound Blaster Linux Control Center explicit Speaker Fill DSP
+context.modules = [
+  {{ name = libpipewire-module-filter-chain
+    args = {{
+      node.description = "Sound Blaster Explicit Speaker Fill"
+      media.name = "Sound Blaster Explicit Speaker Fill"
+      filter.graph = {{
+        nodes = [
+          {{ type = builtin name = copy_l label = copy }}
+          {{ type = builtin name = copy_r label = copy }}
+          {{ type = builtin name = front_l label = mixer control = {{ "Gain 1" = {v("front_l:Gain 1"):.8f} "Gain 2" = {v("front_l:Gain 2"):.8f} }} }}
+          {{ type = builtin name = front_r label = mixer control = {{ "Gain 1" = {v("front_r:Gain 1"):.8f} "Gain 2" = {v("front_r:Gain 2"):.8f} }} }}
+          {{ type = builtin name = rear_l label = mixer control = {{ "Gain 1" = {v("rear_l:Gain 1"):.8f} "Gain 2" = {v("rear_l:Gain 2"):.8f} }} }}
+          {{ type = builtin name = rear_r label = mixer control = {{ "Gain 1" = {v("rear_r:Gain 1"):.8f} "Gain 2" = {v("rear_r:Gain 2"):.8f} }} }}
+          {{ type = builtin name = rear_delay_l label = delay config = {{ "max-delay" = 0.050 }} control = {{ "Delay (s)" = {v("rear_delay_l:Delay (s)"):.8f} }} }}
+          {{ type = builtin name = rear_delay_r label = delay config = {{ "max-delay" = 0.050 }} control = {{ "Delay (s)" = {v("rear_delay_r:Delay (s)"):.8f} }} }}
+          {{ type = builtin name = center label = mixer control = {{ "Gain 1" = {v("center:Gain 1"):.8f} "Gain 2" = {v("center:Gain 2"):.8f} }} }}
+          {{ type = builtin name = lfe_sum label = mixer control = {{ "Gain 1" = {v("lfe_sum:Gain 1"):.8f} "Gain 2" = {v("lfe_sum:Gain 2"):.8f} }} }}
+          {{ type = builtin name = lfe_lp label = bq_lowpass control = {{ "Freq" = {v("lfe_lp:Freq"):.1f} "Q" = {v("lfe_lp:Q"):.8f} }} }}
+        ]
+        links = [
+          {{ output = "copy_l:Out" input = "front_l:In 1" }}
+          {{ output = "copy_r:Out" input = "front_l:In 2" }}
+          {{ output = "copy_l:Out" input = "front_r:In 1" }}
+          {{ output = "copy_r:Out" input = "front_r:In 2" }}
+          {{ output = "copy_l:Out" input = "rear_l:In 1" }}
+          {{ output = "copy_r:Out" input = "rear_l:In 2" }}
+          {{ output = "copy_l:Out" input = "rear_r:In 1" }}
+          {{ output = "copy_r:Out" input = "rear_r:In 2" }}
+          {{ output = "rear_l:Out" input = "rear_delay_l:In" }}
+          {{ output = "rear_r:Out" input = "rear_delay_r:In" }}
+          {{ output = "copy_l:Out" input = "center:In 1" }}
+          {{ output = "copy_r:Out" input = "center:In 2" }}
+          {{ output = "copy_l:Out" input = "lfe_sum:In 1" }}
+          {{ output = "copy_r:Out" input = "lfe_sum:In 2" }}
+          {{ output = "lfe_sum:Out" input = "lfe_lp:In" }}
+        ]
+        inputs = [ "copy_l:In" "copy_r:In" ]
+        outputs = [ "front_l:Out" "front_r:Out" "rear_delay_l:Out" "rear_delay_r:Out" "center:Out" "lfe_lp:Out" ]
+      }}
+      capture.props = {{
+        node.name = "{FILL_SINK}"
+        node.description = "Sound Blaster Stereo Speaker Fill"
+        media.class = "Audio/Sink"
+        node.virtual = true
+        audio.channels = 2
+        audio.position = [ FL FR ]
+      }}
+      playback.props = {{
+        node.name = "{FILL_OUTPUT_NODE}"
+        node.description = "Sound Blaster Explicit Fill 5.1 Output"
+        node.passive = true
+        stream.dont-remix = true
+        target.object = "{SINK}"
+        audio.channels = 6
+        audio.position = [ FL FR RL RR FC LFE ]
+      }}
+    }}
+  }}
+]
+"""
+
+
+def _named_node_ids(*names):
+    result = run(["pw-dump"], capture=True)
+    if result.returncode != 0:
+        return {}
+    wanted = set(names)
+    found = {}
+    try:
+        objects = json.loads(result.stdout)
+    except Exception:
+        return {}
+    for obj in objects:
+        try:
+            props = obj.get("info", {}).get("props", {})
+            name = props.get("node.name")
+            if name in wanted:
+                found[name] = int(obj["id"])
+        except Exception:
+            pass
+    return found
+
+
+def explicit_fill_graph_live():
+    nodes = _named_node_ids(FILL_SINK, FILL_OUTPUT_NODE)
+    return FILL_SINK in nodes and FILL_OUTPUT_NODE in nodes
+
+
+def get_fill_filter_node_id():
+    return _named_node_ids(FILL_SINK).get(FILL_SINK)
+
+
+def set_fill_filter_controls(settings):
+    node_id = get_fill_filter_node_id()
+    if node_id is None:
+        return False
+    values = []
+    for name, value in fill_dsp_controls(settings).items():
+        values.extend([f'"{name}"', f'{float(value):.8f}'])
+    payload = '{ "params": [ ' + ' '.join(values) + ' ] }'
+    return run(["pw-cli", "s", str(node_id), "Props", payload], capture=True).returncode == 0
+
+
+def ensure_explicit_fill_graph(settings, restart_if_missing=True):
+    """Ensure the explicit Fill sink is loaded and its controls are current."""
+    if not uses_explicit_fill_dsp(settings):
+        return False
+    ensure_user_writable_config_dir(FILL_DSP_CONFIG.parent)
+    wanted = fill_dsp_config_text(settings)
+    try:
+        if not FILL_DSP_CONFIG.exists() or FILL_DSP_CONFIG.read_text() != wanted:
+            FILL_DSP_CONFIG.write_text(wanted)
+    except Exception:
+        return False
+    if not explicit_fill_graph_live() and restart_if_missing:
+        # v3.3.43-v3.3.49 may have left the old pw-loopback process alive.
+        # Remove only our named legacy loopback before loading the new graph so
+        # a stale soundblaster_zse_fill sink cannot masquerade as v3.3.52 DSP.
+        _kill_external_fill_loopback()
+        wait_for_sink_gone(FILL_SINK, 2.0)
+        try:
+            if not restart_filter_chain_service():
+                return False
+        except Exception:
+            return False
+        if not wait_for_sink(SINK, 8) or not wait_for_sink(FILL_SINK, 8):
+            return False
+        end = time.time() + 4.0
+        while time.time() < end and not explicit_fill_graph_live():
+            time.sleep(0.1)
+    return explicit_fill_graph_live() and set_fill_filter_controls(settings)
 
 
 MAIN_BASS_POSITIONS = ("FL", "FR", "RL", "RR", "FC")
@@ -576,12 +917,16 @@ def ubuntu_bass_eq_graph(gains, preamp_db, settings):
 
 def eq_config_text(target_sink, gains=None, positions=None, preamp_db=0.0, settings=None, compatibility=None):
     if compatibility is None:
-        compatibility = is_bazzite()
+        compatibility = uses_dedicated_fill_route(settings)
     gains = gains or {f: 0.0 for f in BANDS}
     positions = positions or filter_channel_positions(target_sink)
     channel_count = len(positions)
     position_text = " ".join(positions)
-    explicit_bass = not compatibility and positions == ["FL", "FR", "RL", "RR", "FC", "LFE"]
+    # Compatibility routing (used by the persistent A52 sink) only changes how
+    # the filter-chain connects to its hardware target. It must not disable the
+    # six-channel Bass Management DSP. Bazzite is the one deliberate exception:
+    # preserve its verified compatibility graph unchanged.
+    explicit_bass = (not is_bazzite()) and positions == ["FL", "FR", "RL", "RR", "FC", "LFE"]
     if explicit_bass:
         nodes, links, inputs, outputs = ubuntu_bass_eq_graph(gains, preamp_db, settings or DEFAULT_CURRENT)
         graph_ports = "        inputs = [ " + " ".join(inputs) + " ]\n        outputs = [ " + " ".join(outputs) + " ]\n"
@@ -627,6 +972,14 @@ def eq_config_text(target_sink, gains=None, positions=None, preamp_db=0.0, setti
         f'        filter.smart.target = {{ node.name = "{target_sink}" }}\n'
     )
     target_line = f'        target.object = "{target_sink}"\n' if compatibility else ""
+    # An explicit logical layout can intentionally be smaller than the physical
+    # transport.  Digital S/PDIF multichannel uses a 5.1 AC3 carrier even for
+    # logical 2.1/4.0/4.1/5.0 layouts.  Allow PipeWire to map the logical
+    # channels onto that carrier and leave unrequested positions silent.
+    lowered_target = str(target_sink or "").lower()
+    target_is_51_transport = ("surround-51" in lowered_target or
+                              target_sink == "alsa_output.soundblaster_a52_51")
+    dont_remix = "false" if target_is_51_transport and channel_count != 6 else "true"
     return (
         "context.modules = [\n"
         "  {\n"
@@ -665,7 +1018,7 @@ def eq_config_text(target_sink, gains=None, positions=None, preamp_db=0.0, setti
 def fill_config_text(settings=None, compatibility=None):
     """Generate distro-appropriate PipeWire-Pulse Speaker Fill defaults."""
     if compatibility is None:
-        compatibility = is_bazzite()
+        compatibility = uses_dedicated_fill_route(settings)
     s = settings or DEFAULT_CURRENT
     mode = s.get("fill_mode", "PSD")
     upmix = "false" if compatibility or mode == "OFF" else "true"
@@ -675,8 +1028,8 @@ def fill_config_text(settings=None, compatibility=None):
     lfe_cutoff = int(s.get("lfe_cutoff", 150))
     return (
         "stream.properties = {\n"
-        + ("  # Bazzite: stereo fill uses the dedicated soundblaster_zse_fill sink.\n" if compatibility else
-           "  # Ubuntu: v3.3.2 global PipeWire-Pulse Speaker Fill behavior.\n")
+        + ("  # Stable route: stereo fill uses the dedicated soundblaster_zse_fill sink.\n" if compatibility else
+           "  # Global PipeWire-Pulse Speaker Fill behavior.\n")
         + f"  channelmix.upmix = {upmix}\n"
         f'  channelmix.upmix-method = "{method}"\n'
         f"  channelmix.rear-delay = {rear_delay:.1f}\n"
@@ -766,10 +1119,17 @@ def ensure_configs(data, force=False):
     data["current"]["hardware_sink"] = target
     ensure_user_writable_config_dir(EQ_CONFIG.parent)
     ensure_user_writable_config_dir(FILL_CONFIG.parent)
+    ensure_user_writable_config_dir(FILL_DSP_CONFIG.parent)
     if force or not EQ_CONFIG.exists():
         EQ_CONFIG.write_text(eq_config_text(target, gains, preamp_db=effective_preamp_db(data["current"]), settings=data["current"]))
     if force or not FILL_CONFIG.exists():
-        FILL_CONFIG.write_text(fill_config_text(data["current"]))
+        FILL_CONFIG.write_text(fill_config_text(data["current"], compatibility=uses_stable_fill_route(data["current"])))
+    if uses_explicit_fill_dsp(data["current"]):
+        wanted_fill_dsp = fill_dsp_config_text(data["current"])
+        if force or not FILL_DSP_CONFIG.exists() or FILL_DSP_CONFIG.read_text() != wanted_fill_dsp:
+            FILL_DSP_CONFIG.write_text(wanted_fill_dsp)
+    elif FILL_DSP_CONFIG.exists():
+        FILL_DSP_CONFIG.unlink()
     save_data(data)
 
 
@@ -842,7 +1202,33 @@ def persist_bass_management_config(settings):
         return False
     EQ_CONFIG.write_text(eq_config_text(
         target, gains, positions=["FL", "FR", "RL", "RR", "FC", "LFE"],
-        preamp_db=effective_preamp_db(settings), settings=settings, compatibility=False))
+        preamp_db=effective_preamp_db(settings), settings=settings,
+        compatibility=uses_dedicated_fill_route(settings)))
+    return True
+
+
+def rebuild_bass_management_graph(settings):
+    """Recreate the explicit 5.1 bass graph where live biquad Props are unreliable.
+
+    Mint's older PipeWire accepts control writes without audibly rebuilding the
+    active filters (the same behavior proven on its old channelmix path).  Bake
+    the requested crossover/routing into the config and restart only our user
+    filter-chain service.  The persistent A52 hardware sink is not restarted.
+    """
+    if is_bazzite() or not explicit_bass_graph_configured():
+        return False
+    if not persist_bass_management_config(settings):
+        return False
+    if not restart_filter_chain_service():
+        return False
+    if not wait_for_sink(SINK, 8):
+        return False
+    if uses_explicit_fill_dsp(settings):
+        if not wait_for_sink(FILL_SINK, 8):
+            return False
+        # The filter-chain restart also recreates the explicit Fill graph.
+        # Reassert its controls without changing the verified v3.3.50 topology.
+        set_fill_filter_controls(settings)
     return True
 
 
@@ -952,13 +1338,15 @@ def replace_setting(text, name, value):
     return text[:pos] + f"  {name} = {value}\n" + text[pos:]
 
 
-def write_spatial(settings):
-    # Rewrite this small generated drop-in atomically. Speaker Fill rules are
-    # mode-dependent, so editing individual keys can leave stale global/rule
-    # settings behind when switching OFF/PSD/FULL.
+def write_spatial(settings, compatibility=None):
+    # Rewrite this small generated drop-in atomically.  Application/dedicated
+    # Fill owns its own stereo->surround graph, so global PipeWire-Pulse upmix
+    # must be disabled while that route is active.
+    if compatibility is None:
+        compatibility = uses_stable_fill_route(settings)
     FILL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     tmp = FILL_CONFIG.with_suffix(FILL_CONFIG.suffix + ".tmp")
-    tmp.write_text(fill_config_text(settings))
+    tmp.write_text(fill_config_text(settings, compatibility=compatibility))
     tmp.replace(FILL_CONFIG)
 
 
@@ -1219,7 +1607,7 @@ def restore_at_login(data):
         restore_log(f"startup restore FAILED: {SINK} did not appear")
         return False
     target = data["current"].get("hardware_sink", "")
-    if target and sink_exists(target):
+    if target and sink_exists(target) and soundblaster_default_selected():
         set_default_sink(target)
     apply_bass_management_live(data["current"])
     channels_ok = restore_channel_levels_verified(data["current"])
@@ -1461,6 +1849,10 @@ if "--generate-eq-config" in sys.argv:
         sys.exit(2)
     _data = load_data()
     _gains, _existing = parse_eq_config()
+    # Installer upgrades may pass a target preserved from the old EQ graph.
+    # If that stereo node is stale and the same device's 5.1 sibling is live,
+    # generate against the live 5.1 node instead of recreating a 2-channel EQ.
+    _target = resolve_live_surround_sibling(_target)
     _data["current"]["hardware_sink"] = _target
     # state.json is authoritative for the selected/current EQ.  Using only the
     # pre-install filter graph can resurrect a stale curve on the first launch
@@ -1469,10 +1861,184 @@ if "--generate-eq-config" in sys.argv:
     if isinstance(_saved_eq, dict) and _saved_eq:
         _gains = {f: float(_saved_eq.get(str(f), _saved_eq.get(f, _gains.get(f, 0.0)))) for f in BANDS}
     _output.parent.mkdir(parents=True, exist_ok=True)
+    _requested_positions = requested_layout_positions(_data.get("current", {}).get("speaker_layout"))
     _output.write_text(eq_config_text(
-        _target, _gains, preamp_db=effective_preamp_db(_data["current"]),
+        _target, _gains, positions=(_requested_positions or None),
+        preamp_db=effective_preamp_db(_data["current"]),
         settings=_data["current"], compatibility=is_bazzite()))
     sys.exit(0)
+
+def _sink_id_name_map():
+    result = run(["pactl", "list", "short", "sinks"], capture=True)
+    out = {}
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                out[parts[0].strip()] = parts[1].strip()
+    return out
+
+def playback_sink_inputs():
+    """Return playback streams with Pulse sink id/name and original channel count."""
+    result = run(["pactl", "list", "sink-inputs"], capture=True)
+    if result.returncode != 0:
+        return []
+    sink_names = _sink_id_name_map()
+    streams = []
+    chunks = re.split(r"(?=Sink Input #\d+)", result.stdout)
+    for chunk in chunks:
+        m_id = re.search(r"Sink Input #(\d+)", chunk)
+        if not m_id:
+            continue
+        m_sink = re.search(r"^\s*Sink:\s*(\d+)\s*$", chunk, re.M)
+        m_spec = re.search(r"^\s*Sample Specification:.*?\s(\d+)ch\s", chunk, re.M)
+        m_node = re.search(r'^\s*node\.name\s*=\s*"([^"]+)"', chunk, re.M)
+        m_app = re.search(r'^\s*application\.name\s*=\s*"([^"]+)"', chunk, re.M)
+        if not (m_sink and m_spec):
+            continue
+        sid = m_sink.group(1)
+        streams.append({
+            "id": int(m_id.group(1)),
+            "sink_id": sid,
+            "sink": sink_names.get(sid, ""),
+            "channels": int(m_spec.group(1)),
+            "node": m_node.group(1) if m_node else "",
+            "app": m_app.group(1) if m_app else "",
+        })
+    return streams
+
+
+def _fill_output_id():
+    """Return the PipeWire object id for our persistent fill playback stream."""
+    result = run(["pw-dump"], capture=True)
+    if result.returncode != 0:
+        return None
+    try:
+        objects = json.loads(result.stdout)
+    except Exception:
+        return None
+    for obj in objects:
+        info = obj.get("info", {}) if isinstance(obj, dict) else {}
+        props = info.get("props", {}) if isinstance(info, dict) else {}
+        if props.get("node.name") == FILL_OUTPUT_NODE:
+            try: return int(obj.get("id"))
+            except Exception: return None
+    return None
+
+def update_fill_processing(settings):
+    """Change fill processing in-place without moving active application streams."""
+    if uses_explicit_fill_dsp(settings):
+        return set_fill_filter_controls(settings)
+    node_id = _fill_output_id()
+    if node_id is None:
+        return False
+    mode = settings.get("fill_mode", "PSD")
+    enabled = mode != "OFF"
+    method = "simple" if mode == "FULL" else "psd"
+    # PipeWire exposes channel-mixer controls in the node Props parameter.
+    # Updating this adapter in-place avoids destroying the virtual sink and
+    # therefore avoids Pulse clients interpreting a sink move as a pause.
+    pod = ('{ params = [ '
+           f'"channelmix.upmix" {str(enabled).lower()} '
+           f'"channelmix.upmix-method" "{method}" '
+           f'"channelmix.rear-delay" {float(settings.get("rear_delay",12.0)):.1f} '
+           f'"channelmix.stereo-widen" {float(settings.get("stereo_width",0.0)):.2f} '
+           f'"channelmix.lfe-cutoff" {int(settings.get("lfe_cutoff",150))} '
+           '] }')
+    r = run(["pw-cli", "set-param", str(node_id), "Props", pod], capture=True)
+    return r.returncode == 0
+
+
+def restore_when_selected():
+    """One-shot, GUI-independent recovery; never select Sound Blaster for the user.
+
+    The system (WirePlumber/PipeWire) must first select the configured Sound
+    Blaster card or our own virtual EQ. A saved six-channel output is restored
+    only from a stereo fallback on that SAME card. No guessed surround profiles,
+    no global PipeWire restart, and no moving application streams.
+    """
+    data = load_data()
+    current = data.get("current", {})
+    target = str(current.get("hardware_sink") or "")
+    selected = default_sink_name()
+    if not target or not selected or not soundblaster_default_selected(selected, target):
+        return False
+    if target.startswith("alsa_output.") and not sink_exists(target):
+        # Only attempt to recover previously selected surround output, never
+        # activate experimental analog multichannel on another user's system.
+        profile = target.split(".")[-1]
+        if profile in ("iec958-ac3-surround-51", "analog-surround-51"):
+            # Locate the exact owning ALSA card by the persistent PCI/USB id
+            # embedded in the saved physical sink, not by a guessed card index.
+            stem = target.rsplit(".", 1)[0].removeprefix("alsa_output.")
+            card_name = "alsa_card." + stem
+            cards = run(["pactl", "list", "cards"], capture=True)
+            block = next((b for b in re.split(r"\n(?=Card #)", cards.stdout)
+                          if re.search(rf"(?m)^\s*Name: {re.escape(card_name)}\s*$", b)), "")
+            if not block or not any(x in block.lower() for x in
+                                    ("ca0132", "sound blaster", "sound core3d", "recon3d")):
+                return False
+            options = ["output:" + profile + "+input:analog-stereo",
+                       "output:" + profile + "+input:iec958-stereo",
+                       "output:" + profile]
+            available = [x for x in options if re.search(
+                rf"(?m)^\s*{re.escape(x)}:.*available: yes\)", block)]
+            if not available:
+                restore_log("device-return: saved hardware profile unavailable")
+                return False
+            # Re-check selection immediately before modifying the profile.
+            if not soundblaster_default_selected(default_sink_name(), target):
+                return False
+            result = run(["pactl", "set-card-profile", card_name, available[0]], capture=True)
+            if result.returncode != 0:
+                restore_log("device-return: failed to restore saved card profile")
+                return False
+            restore_log("device-return: restored saved Sound Blaster card profile")
+            if not wait_for_sink(target, 7):
+                restore_log("device-return: saved sink did not reappear")
+                return False
+    if not sink_exists(target):
+        return False
+    # A card profile transition can make PipeWire choose another default.
+    # Respect that choice rather than redirecting a headset or HDMI device.
+    if not soundblaster_default_selected(default_sink_name(), target):
+        return False
+    if not sink_exists(SINK):
+        restore_log("device-return: EQ sink unavailable (no global audio restart)")
+        return False
+    ok = restore_live_eq_verified(current, attempts=3)
+    # Reassert the same DSP controls that GUI startup restores. The first
+    # two-channel impression can reflect a stereo stream bypassing Speaker
+    # Fill despite the physical AC3 sink and logical EQ both being six-channel.
+    apply_bass_management_live(current)
+    ok = restore_channel_levels_verified(current, attempts=2) and ok
+    ok = restore_preamp_verified(current, attempts=3, persist=False) and ok
+    # The GUI's fill-maintenance worker is not alive when the window is closed.
+    # Only repair *existing Sound Blaster streams*, never forcibly move a
+    # headset/HDMI/Bluetooth stream to this output. No graph restarts here.
+    if uses_stable_fill_route(current) and sink_exists(FILL_SINK):
+        fill_updated = update_fill_processing(current)
+        if not fill_updated:
+            restore_log("device-return: Speaker Fill controls unavailable")
+            ok = False
+        if soundblaster_default_selected(default_sink_name(), target):
+            for stream in playback_sink_inputs():
+                if stream["node"] in (OUTPUT_NODE, FILL_OUTPUT_NODE, FILL_LOOP_NAME):
+                    continue
+                if stream["channels"] == 2 and stream["sink"] == SINK:
+                    run(["pactl", "move-sink-input", str(stream["id"]), FILL_SINK], capture=True)
+                elif stream["channels"] != 2 and stream["sink"] == FILL_SINK:
+                    run(["pactl", "move-sink-input", str(stream["id"]), SINK], capture=True)
+    restore_log("device-return: " + ("restored" if ok else "incomplete"))
+    return ok
+
+
+if "--restore-selected" in sys.argv:
+    try:
+        sys.exit(0 if restore_when_selected() else 1)
+    except Exception as exc:
+        restore_log(f"device-return: unexpected failure: {exc}")
+        sys.exit(1)
 
 if "--restore" in sys.argv:
     _data = load_data()
@@ -1489,6 +2055,7 @@ if "--check" in sys.argv:
     print(f"version={VERSION}")
     print(f"eq_config={EQ_CONFIG} exists={EQ_CONFIG.exists()}")
     print(f"fill_config={FILL_CONFIG} exists={FILL_CONFIG.exists()}")
+    print(f"fill_dsp_config={FILL_DSP_CONFIG} exists={FILL_DSP_CONFIG.exists()}")
     print(f"configured_target={d['current'].get('hardware_sink') or target}")
     print(f"soundblaster_zse_eq_present={sink_exists(SINK)}")
     print(f"default_sink={default_sink_name()}")
@@ -1509,7 +2076,8 @@ if CONFIG_TARGET and not DATA["current"].get("hardware_sink"):
     DATA["current"]["hardware_sink"] = CONFIG_TARGET
     save_data(DATA)
 
-ACTIVE_POSITIONS=sink_channel_positions(DATA["current"].get("hardware_sink", ""))
+_REQUESTED_ACTIVE_POSITIONS = requested_layout_positions(DATA["current"].get("speaker_layout"))
+ACTIVE_POSITIONS = _REQUESTED_ACTIVE_POSITIONS or sink_channel_positions(DATA["current"].get("hardware_sink", ""))
 ACTIVE_LAYOUT=layout_name(ACTIVE_POSITIONS)
 CHANNEL_KEYS=list(dict.fromkeys(channel_key_for_position(p) for p in ACTIVE_POSITIONS if channel_key_for_position(p)))
 
@@ -1577,6 +2145,7 @@ analyzer_levels = [-70.0] * 28
 analyzer_proc = None
 analyzer_procs = []
 analyzer_stop = threading.Event()
+fill_route_lock = threading.Lock()
 channel_meter_canvas = None
 channel_meter_levels = {}
 channel_meter_peaks = {}
@@ -1859,6 +2428,10 @@ def load_custom(slot):
     display = entry.get("name", f"Custom {slot}")
     load_settings_into_gui(entry["settings"], display)
     set_active_preset(f"custom:{slot}", display)
+    # Keep the bottom status bar in sync with built-in preset recall.  The
+    # audio/EQ state was already switching correctly; older builds simply left
+    # the previous built-in "Preset loaded: ..." message visible here.
+    status_var.set(f"Preset loaded: {display}")
 
 
 def refresh_preset_labels():
@@ -1935,45 +2508,6 @@ def live_set_spatial_ubuntu(settings):
     return ok
 
 
-def _sink_id_name_map():
-    result = run(["pactl", "list", "short", "sinks"], capture=True)
-    out = {}
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                out[parts[0].strip()] = parts[1].strip()
-    return out
-
-def playback_sink_inputs():
-    """Return playback streams with Pulse sink id/name and original channel count."""
-    result = run(["pactl", "list", "sink-inputs"], capture=True)
-    if result.returncode != 0:
-        return []
-    sink_names = _sink_id_name_map()
-    streams = []
-    chunks = re.split(r"(?=Sink Input #\d+)", result.stdout)
-    for chunk in chunks:
-        m_id = re.search(r"Sink Input #(\d+)", chunk)
-        if not m_id:
-            continue
-        m_sink = re.search(r"^\s*Sink:\s*(\d+)\s*$", chunk, re.M)
-        m_spec = re.search(r"^\s*Sample Specification:.*?\s(\d+)ch\s", chunk, re.M)
-        m_node = re.search(r'^\s*node\.name\s*=\s*"([^"]+)"', chunk, re.M)
-        m_app = re.search(r'^\s*application\.name\s*=\s*"([^"]+)"', chunk, re.M)
-        if not (m_sink and m_spec):
-            continue
-        sid = m_sink.group(1)
-        streams.append({
-            "id": int(m_id.group(1)),
-            "sink_id": sid,
-            "sink": sink_names.get(sid, ""),
-            "channels": int(m_spec.group(1)),
-            "node": m_node.group(1) if m_node else "",
-            "app": m_app.group(1) if m_app else "",
-        })
-    return streams
-
 def _fill_signature(settings):
     mode = settings.get("fill_mode", "PSD")
     return (mode, float(settings.get("rear_delay", 12.0)),
@@ -2009,47 +2543,14 @@ def stop_fill_loopback(move_streams=True):
     FILL_PROC = None
     FILL_SIGNATURE = None
 
-def _fill_output_id():
-    """Return the PipeWire object id for our persistent fill playback stream."""
-    result = run(["pw-dump"], capture=True)
-    if result.returncode != 0:
-        return None
-    try:
-        objects = json.loads(result.stdout)
-    except Exception:
-        return None
-    for obj in objects:
-        info = obj.get("info", {}) if isinstance(obj, dict) else {}
-        props = info.get("props", {}) if isinstance(info, dict) else {}
-        if props.get("node.name") == FILL_OUTPUT_NODE:
-            try: return int(obj.get("id"))
-            except Exception: return None
-    return None
-
-def update_fill_processing(settings):
-    """Change fill mode in-place so active browser/media streams never change sinks."""
-    node_id = _fill_output_id()
-    if node_id is None:
-        return False
-    mode = settings.get("fill_mode", "PSD")
-    enabled = mode != "OFF"
-    method = "simple" if mode == "FULL" else "psd"
-    # PipeWire exposes channel-mixer controls in the node Props parameter.
-    # Updating this adapter in-place avoids destroying the virtual sink and
-    # therefore avoids Pulse clients interpreting a sink move as a pause.
-    pod = ('{ params = [ '
-           f'"channelmix.upmix" {str(enabled).lower()} '
-           f'"channelmix.upmix-method" "{method}" '
-           f'"channelmix.rear-delay" {float(settings.get("rear_delay",12.0)):.1f} '
-           f'"channelmix.stereo-widen" {float(settings.get("stereo_width",0.0)):.2f} '
-           f'"channelmix.lfe-cutoff" {int(settings.get("lfe_cutoff",150))} '
-           '] }')
-    r = run(["pw-cli", "set-param", str(node_id), "Props", pod], capture=True)
-    return r.returncode == 0
-
 def start_fill_loopback(settings, force_restart=False):
-    """Create one persistent 2-channel virtual sink feeding the 5.1 EQ."""
+    """Create/ensure the stable 2-channel Fill sink feeding the 5.1 EQ."""
     global FILL_PROC, FILL_SIGNATURE
+    if uses_explicit_fill_dsp(settings):
+        ok = ensure_explicit_fill_graph(settings, restart_if_missing=True)
+        if ok:
+            FILL_SIGNATURE = _fill_signature(settings)
+        return ok
     if not shutil.which("pw-loopback") or not sink_exists(SINK):
         return False
     if sink_exists(FILL_SINK) and not force_restart:
@@ -2057,7 +2558,10 @@ def start_fill_loopback(settings, force_restart=False):
         return update_fill_processing(settings)
     if sink_exists(FILL_SINK) or force_restart:
         stop_fill_loopback(move_streams=True)
-        time.sleep(0.15)
+        # Older PipeWire can leave the old virtual sink visible briefly after
+        # pw-loopback exits. Wait so readiness checks see the replacement.
+        wait_for_sink_gone(FILL_SINK, 2.0)
+        time.sleep(0.05)
     mode = settings.get("fill_mode", "PSD")
     enabled = mode != "OFF"
     method = "simple" if mode == "FULL" else "psd"
@@ -2067,11 +2571,18 @@ def start_fill_loopback(settings, force_restart=False):
         'media.class = "Audio/Sink" node.virtual = true '
         'audio.channels = 2 audio.position = [ FL FR ] }'
     )
+    fill_positions = requested_layout_positions(settings.get("speaker_layout")) or ["FL", "FR", "RL", "RR", "FC", "LFE"]
+    fill_position_text = " ".join(fill_positions)
+    fill_channels = len(fill_positions)
     playback_props = (
         '{ node.name = "' + FILL_OUTPUT_NODE + '" '
-        'node.description = "Sound Blaster Stereo Fill 5.1 Output" '
-        'node.passive = true stream.dont-remix = true '
-        'audio.channels = 6 audio.position = [ FL FR RL RR FC LFE ] '
+        f'node.description = "Sound Blaster Stereo Fill {layout_name(fill_positions)} Output" '
+        # The dedicated loopback always captures stereo and expands only to the
+        # currently selected logical Speaker Setup layout.  The physical digital
+        # carrier may still be 5.1 AC3; the EQ/output adapter maps the logical
+        # channels onto that carrier with unused positions silent.
+        'node.passive = true stream.dont-remix = false '
+        f'audio.channels = {fill_channels} audio.position = [ {fill_position_text} ] '
         f'channelmix.upmix = {str(enabled).lower()} '
         f'channelmix.upmix-method = "{method}" '
         f'channelmix.rear-delay = {float(settings.get("rear_delay",12.0)):.1f} '
@@ -2096,31 +2607,124 @@ def start_fill_loopback(settings, force_restart=False):
     update_fill_processing(settings)
     return True
 
-def route_speaker_fill_streams(settings, force_restart=False):
+def route_speaker_fill_streams(settings, force_restart=False, wait_for_lock=True):
     """Keep stereo applications on one stable fill sink for OFF/PSD/FULL.
 
     The fill sink always exists while the GUI is active. OFF simply disables
     upmix in-place, leaving stereo on FL/FR; PSD/FULL enable upmix in-place.
-    Native multichannel streams never enter this 2-channel sink.
+    Native multichannel streams never enter this 2-channel sink.  The route
+    lock prevents the background stream-maintenance pass from colliding with
+    an interactive Fill change.
     """
-    if not start_fill_loopback(settings, force_restart=force_restart):
-        return False
-    ok = update_fill_processing(settings)
-    for stream in playback_sink_inputs():
-        if stream["node"] in (OUTPUT_NODE, FILL_OUTPUT_NODE):
-            continue
-        if stream["channels"] == 2:
-            if stream["sink"] != FILL_SINK:
-                r = run(["pactl", "move-sink-input", str(stream["id"]), FILL_SINK], capture=True)
-                ok = ok and r.returncode == 0
-        elif stream["sink"] == FILL_SINK and sink_exists(SINK):
-            run(["pactl", "move-sink-input", str(stream["id"]), SINK], capture=True)
+    acquired = fill_route_lock.acquire(blocking=wait_for_lock)
+    if not acquired:
+        return True
+    try:
+        if not start_fill_loopback(settings, force_restart=force_restart):
+            return False
+        ok = update_fill_processing(settings)
+        for stream in playback_sink_inputs():
+            if stream["node"] in (OUTPUT_NODE, FILL_OUTPUT_NODE):
+                continue
+            if stream["channels"] == 2:
+                if stream["sink"] != FILL_SINK:
+                    r = run(["pactl", "move-sink-input", str(stream["id"]), FILL_SINK], capture=True)
+                    ok = ok and r.returncode == 0
+            elif stream["sink"] == FILL_SINK and sink_exists(SINK):
+                run(["pactl", "move-sink-input", str(stream["id"]), SINK], capture=True)
+        return ok
+    finally:
+        fill_route_lock.release()
+
+
+def fill_route_maintenance_worker():
+    """Maintain dedicated A52/Bazzite stream routing off the Tk event thread."""
+    while not analyzer_stop.is_set():
+        try:
+            current = DATA.get("current", {})
+            if uses_stable_fill_route(current) and sink_exists(SINK) and soundblaster_default_selected():
+                route_speaker_fill_streams(current, force_restart=False, wait_for_lock=False)
+        except Exception:
+            pass
+        analyzer_stop.wait(2.0)
+
+def switch_fill_engine_live(settings):
+    """Make the live audio graph match the saved Fill Engine selection.
+
+    v3.3.63 saved the selector but could leave the application-owned Fill
+    graph loaded.  This handoff deliberately tears down the old engine before
+    activating the requested one, so UI state and audible routing cannot drift.
+    """
+    s = dict(settings)
+    engine = str(s.get("fill_engine", "application")).lower()
+
+    # First move any applications out of our virtual Fill sink.  This prevents
+    # a stale application graph from continuing to process audio during handoff.
+    if sink_exists(SINK):
+        for stream in playback_sink_inputs():
+            if stream["sink"] == FILL_SINK and stream["node"] != FILL_OUTPUT_NODE:
+                run(["pactl", "move-sink-input", str(stream["id"]), SINK], capture=True)
+
+    if engine == "pipewire":
+        # Remove both possible application-owned Fill implementations.
+        stop_fill_loopback(move_streams=False)
+        had_explicit = explicit_fill_graph_live() or FILL_DSP_CONFIG.exists()
+        try:
+            if FILL_DSP_CONFIG.exists():
+                FILL_DSP_CONFIG.unlink()
+        except Exception:
+            return False
+        if had_explicit:
+            try:
+                if not restart_filter_chain_service():
+                    return False
+            except Exception:
+                return False
+            if not wait_for_sink(SINK, 8):
+                return False
+
+        # A52/Bazzite retain their verified dedicated compatibility loopback;
+        # normal analog/native-AC3 targets use PipeWire-Pulse channelmix.
+        dedicated = uses_dedicated_fill_route(s)
+        write_spatial(s, compatibility=dedicated)
+        if dedicated:
+            ok = route_speaker_fill_streams(s, force_restart=True)
+        else:
+            ok = restart_pipewire_pulse_defaults()
+            if ok:
+                ok = live_set_spatial_ubuntu(s) or s.get("fill_mode") == "OFF"
+        apply_preamp(s, bypass_var.get())
+        apply_channel_levels(s, bypass_var.get())
+        return ok
+
+    # Application Fill: disable global PipeWire-Pulse upmix first so there is
+    # never a second mixer underneath our deterministic 2->5.1 graph.
+    write_spatial(s, compatibility=True)
+    if not uses_dedicated_fill_route(s):
+        restart_pipewire_pulse_defaults()
+    ok = ensure_explicit_fill_graph(s, restart_if_missing=True)
+    if ok:
+        ok = route_speaker_fill_streams(s, force_restart=False)
+    apply_preamp(s, bypass_var.get())
+    apply_channel_levels(s, bypass_var.get())
     return ok
 
+
 def live_set_spatial(settings):
-    """Apply the distro-specific, hardware-verified Speaker Fill path."""
-    if is_bazzite():
-        return route_speaker_fill_streams(settings, force_restart=False)
+    """Apply the distro/target-specific, hardware-verified Speaker Fill path."""
+    if uses_stable_fill_route(settings):
+        force_restart = False
+        if uses_explicit_fill_dsp(settings):
+            return route_speaker_fill_streams(settings, force_restart=False)
+        if fill_live_channelmix_needs_recreate():
+            requested = _fill_signature(settings)
+            # Mint 22.3 / PipeWire 1.0.x accepts live Props and reports the new
+            # values, but the active channel mixer can keep creation-time DSP.
+            # Recreate only the Fill loopback when its audible parameters change.
+            force_restart = sink_exists(FILL_SINK) and (
+                FILL_SIGNATURE is None or FILL_SIGNATURE != requested
+            )
+        return route_speaker_fill_streams(settings, force_restart=force_restart)
     return live_set_spatial_ubuntu(settings)
 
 def _apply_spatial_live():
@@ -2135,21 +2739,25 @@ def _apply_spatial_live():
             previous_text = FILL_CONFIG.read_text()
         except Exception:
             pass
-        new_text = fill_config_text(s)
+        new_text = fill_config_text(s, compatibility=uses_stable_fill_route(s))
         # Persist defaults first. On Ubuntu, PipeWire-Pulse only reads these
         # stream.properties at process start, so a changed file must be followed
         # by a PipeWire-Pulse-only refresh. This fixes stale upmix=true/simple
         # settings surviving after the GUI has already switched Speaker Fill OFF.
-        write_spatial(s)
+        write_spatial(s, compatibility=uses_stable_fill_route(s))
+        if uses_explicit_fill_dsp(s):
+            ensure_user_writable_config_dir(FILL_DSP_CONFIG.parent)
+            FILL_DSP_CONFIG.write_text(fill_dsp_config_text(s))
         save_current_state()
         refreshed = False
-        if not is_bazzite() and previous_text != new_text:
+        dedicated_fill = uses_stable_fill_route(s)
+        if not dedicated_fill and previous_text != new_text:
             refreshed = restart_pipewire_pulse_defaults()
         live_ok = live_set_spatial(s)
-        if is_bazzite():
+        if dedicated_fill:
             if live_ok:
-                # Preserve v3.3.15: fill path updates can trigger session-state
-                # restoration, so reassert persistent DSP/calibration values.
+                # Dedicated fill changes are live; older PipeWire may recreate only the Fill loopback. Reassert persistent
+                # DSP/calibration values in case the session manager restored state.
                 apply_preamp(s, bypass_var.get())
                 apply_channel_levels(s, bypass_var.get())
                 status_var.set("Stereo Speaker Fill updated live" if s.get("fill_mode") != "OFF" else "Speaker Fill off — native channels discrete")
@@ -2161,7 +2769,8 @@ def _apply_spatial_live():
             if refreshed:
                 apply_preamp(s, bypass_var.get())
                 apply_channel_levels(s, bypass_var.get())
-                activate_eq_route(move_existing=False)
+                if soundblaster_default_selected():
+                    activate_eq_route(move_existing=False)
                 status_var.set("Spatial / Fill applied — PipeWire-Pulse defaults refreshed")
             elif live_ok:
                 status_var.set("Spatial / Fill updated live")
@@ -2251,7 +2860,16 @@ def test_speaker(channel):
     aliases={"SL":"RL","SR":"RR"}; wanted=aliases.get(channel,channel)
     normalized=[aliases.get(p,p) for p in ACTIVE_POSITIONS]
     if wanted not in normalized: return
-    if is_bazzite():
+    explicit_layout = requested_layout_positions(DATA.get("current", {}).get("speaker_layout"))
+    if explicit_layout and explicit_layout != LAYOUT_POSITIONS["5.1"] and not is_bazzite():
+        # Test the logical layout through our EQ sink.  This keeps speaker-test's
+        # channel number within the selected layout (for example LFE is #3 in
+        # 2.1) while the output adapter handles any 5.1 digital carrier mapping.
+        if sink_exists(SINK):
+            set_default_sink(SINK)
+        backend = "pulse"
+        number = normalized.index(wanted) + 1
+    elif is_bazzite():
         # Preserve the hardware-verified Bazzite PipeWire mapping unchanged.
         backend = speaker_test_backend()
         if backend == "pipewire":
@@ -2272,9 +2890,10 @@ def test_speaker(channel):
     btn = speaker_test_buttons.get(channel)
     if btn:
         btn.configure(bg=ACCENT, fg="#061317", activebackground=ACCENT)
-        root.after(1400, lambda b=btn: b.configure(bg=PANEL, fg=TEXT, activebackground="#39434a"))
+        root.after(700, lambda b=btn: b.configure(bg=PANEL, fg=TEXT, activebackground="#39434a"))
     env = os.environ.copy()
-    subprocess.Popen(["speaker-test", "-D", backend, "-c", str(len(ACTIVE_POSITIONS)), "-t", "sine", "-f", "700", "-s", str(number), "-l", "1"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(["speaker-test", "-D", backend, "-c", str(len(ACTIVE_POSITIONS)), "-t", "sine", "-f", "700", "-s", str(number), "-l", "1"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    root.after(700, lambda p=proc: p.terminate() if p.poll() is None else None)
 
 
 def refresh_device_list():
@@ -2352,13 +2971,8 @@ def update_connection_status():
             connection_var.set("Sound Blaster EQ and hardware target unavailable")
         # v3.3.8 safety rule: never auto-restart PipeWire/WirePlumber or the
         # EQ service from this polling loop. Recovery is explicitly user-driven.
-    # Only Bazzite uses the persistent v3.3.15 fill sink and stream mover.
-    if is_bazzite():
-        try:
-            if eq_ok:
-                route_speaker_fill_streams(DATA["current"], force_restart=False)
-        except Exception:
-            pass
+    # Dedicated fill-route maintenance runs in a background worker so this
+    # Tk status poll never blocks the controls on slower PipeWire releases.
     root.after(1500, update_connection_status)
 
 
@@ -2531,14 +3145,29 @@ def _wait_for_pw_mono_port(node_name, timeout=2.0):
     return False
 
 
+def pw_record_supports_raw():
+    """Return whether this PipeWire pw-record build accepts the --raw flag."""
+    try:
+        result = run(["pw-record", "--help"], capture=True)
+        return "--raw" in ((result.stdout or "") + (result.stderr or ""))
+    except Exception:
+        return False
+
+
 def _start_physical_port_meter(hardware_sink, pos, index):
     """Start one mono recorder linked to exactly one physical monitor port."""
     node_name = f"soundblaster-zse-meter-{os.getpid()}-{index}-{pos.lower()}"
+    cmd = ["pw-record"]
+    # Newer pw-record builds expose --raw; PipeWire versions shipped by
+    # Linux Mint 22.x do not.  With stdout ('-') and an explicit sample format,
+    # omitting --raw remains a valid capture path on those older builds.
+    if pw_record_supports_raw():
+        cmd.append("--raw")
+    cmd += ["--target=0", "-P", f"node.name={node_name}",
+            "--format=s16", "--rate=48000", "--channels=1", "--channel-map=MONO",
+            "--latency=80ms", "-"]
     proc = subprocess.Popen(
-        ["pw-record", "--raw", "--target=0", "-P", f"node.name={node_name}",
-         "--format=s16", "--rate=48000", "--channels=1", "--channel-map=MONO",
-         "--latency=80ms", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
     if not _wait_for_pw_mono_port(node_name):
         detail = ""
@@ -2765,20 +3394,20 @@ def on_close():
 
 
 # Header / unified dark visual system
-root.geometry("1380x1030")
+root.geometry("1420x1040")
 root.minsize(1120, 760)
 
 # A restrained Creative/Sound-Blaster-inspired palette.  All tabs share these
 # styles so the utility looks like one application instead of separate forms.
-BG = "#050b0f"
-CARD = "#091219"
-PANEL = "#0d1820"
-PANEL2 = "#12222c"
-BORDER = "#263b49"
-TEXT = "#f5f8fa"
-MUTED = "#a8bbc8"
-ACCENT = "#159fe8"
-ACCENT2 = "#53c2ff"
+BG = "#0b0d10"
+CARD = "#12161b"
+PANEL = "#171c22"
+PANEL2 = "#1d242c"
+BORDER = "#303844"
+TEXT = "#f3f5f7"
+MUTED = "#9aa6b2"
+ACCENT = "#1597d4"
+ACCENT2 = "#45b8ee"
 GOOD = "#39d27d"
 WARN = "#f0b33c"
 BAD = "#ff5757"
@@ -2978,9 +3607,9 @@ class ModernScale(tk.Canvas):
         h = max(1, self.winfo_height())
         pad = 11
         frac = max(0.0, min(1.0, self._fraction()))
-        track = "#2d3b45"
-        accent = "#1599e5"
-        accent_hi = "#58c2ff"
+        track = "#313943"
+        accent = ACCENT
+        accent_hi = ACCENT2
         thumb_fill = "#e9f5fb" if not self._hover else "#ffffff"
         thumb_outline = accent_hi if self._hover or self._dragging else accent
         if self.vertical:
@@ -3013,11 +3642,18 @@ def slider_style(scale):
         return
 
 header = tk.Frame(root, bg=BG)
-header.pack(fill="x", padx=18, pady=(12, 6))
-tk.Label(header, text=APP_NAME, bg=BG, fg=TEXT, font=("Arial", 21, "bold")).pack(side="left")
-connection_dot = tk.Label(header, text="●", bg=BG, fg=WARN, font=("Arial", 15, "bold"))
-connection_dot.pack(side="right", padx=(8, 0))
-tk.Label(header, textvariable=connection_var, bg=BG, fg=TEXT, font=("Arial", 10)).pack(side="right")
+header.pack(fill="x", padx=18, pady=(12, 7))
+brand = tk.Frame(header, bg=BG)
+brand.pack(side="left")
+tk.Label(brand, text=APP_NAME, bg=BG, fg=TEXT, font=("Arial", 21, "bold")).pack(anchor="w")
+tk.Label(brand, text="Audio Dashboard  •  EQ  •  Spatial DSP  •  Device Control", bg=BG, fg=MUTED, font=("Arial", 9)).pack(anchor="w", pady=(1,0))
+status_chip = tk.Frame(header, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+status_chip.pack(side="right", padx=(10,0))
+connection_dot = tk.Label(status_chip, text="●", bg=CARD, fg=WARN, font=("Arial", 13, "bold"))
+connection_dot.pack(side="left", padx=(10,5), pady=6)
+tk.Label(status_chip, textvariable=connection_var, bg=CARD, fg=TEXT, font=("Arial", 10, "bold")).pack(side="left", padx=(0,10), pady=6)
+version_chip = tk.Label(header, text=f"v{VERSION}", bg=PANEL2, fg=MUTED, font=("Arial", 9, "bold"), padx=9, pady=5, highlightthickness=1, highlightbackground=BORDER)
+version_chip.pack(side="right")
 
 # Dedicated warning/status strip.
 gain_strip = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
@@ -3050,6 +3686,9 @@ custom_row=ttk.Frame(preset_box,style="Card.TFrame"); custom_row.pack(fill="x",p
 ttk.Label(custom_row,text="Custom",width=9,style="Card.TLabel").pack(side="left")
 for slot in ("1","2","3","4","5"):
     b=ttk.Button(custom_row,text=DATA["custom_presets"][slot].get("name",f"Custom {slot}"),command=lambda s=slot:load_custom(s)); b.pack(side="left",padx=2); custom_recall_buttons[slot]=b
+ttk.Label(custom_row,text="Save / Rename:",style="Card.TLabel").pack(side="left",padx=(12,3))
+for slot in ("1","2","3","4","5"):
+    ttk.Button(custom_row,text=slot,width=3,command=lambda s=slot:save_custom(s)).pack(side="left",padx=1)
 
 # Main page uses two dense columns.  The analyzer belongs under the EQ so the
 # entire left column reads top-to-bottom as shaping -> visualization -> preamp.
@@ -3073,7 +3712,7 @@ for col,freq in enumerate(BANDS):
     slider_style(s); s.set(CURRENT_EQ[freq]); s.grid(row=1,column=col,padx=1,sticky="ns"); eq_sliders[freq]=s
 
 analyzer_frame=ttk.LabelFrame(left,text=" SPECTRUM ANALYZER ",padding=6); analyzer_frame.grid(row=2,column=0,sticky="nsew",pady=(6,0))
-analyzer_canvas=tk.Canvas(analyzer_frame,width=690,height=170,bg="#071015",highlightthickness=1,highlightbackground=BORDER)
+analyzer_canvas=tk.Canvas(analyzer_frame,width=690,height=170,bg="#0d1116",highlightthickness=1,highlightbackground=BORDER)
 analyzer_canvas.pack(fill="both",expand=True)
 ttk.Label(analyzer_frame,textvariable=analyzer_status_var,style="Muted.TLabel",wraplength=680).pack(anchor="w",pady=(3,0))
 
@@ -3090,7 +3729,7 @@ preamp=hslider(preamp_box,"Master Preamp",6,-24,cur["preamp"],0,0,on_preamp_slid
 # calibration. They read the processed hardware monitor, so these are actual
 # output levels rather than decorative indicators.
 meters_frame=ttk.LabelFrame(right,text=f" {ACTIVE_LAYOUT} LIVE OUTPUT LEVELS (dBFS) ",padding=6); meters_frame.grid(row=0,column=0,sticky="ew")
-channel_meter_canvas=tk.Canvas(meters_frame,width=430,height=150,bg="#071015",highlightthickness=1,highlightbackground=BORDER)
+channel_meter_canvas=tk.Canvas(meters_frame,width=430,height=150,bg="#0d1116",highlightthickness=1,highlightbackground=BORDER)
 channel_meter_canvas.pack(fill="x",expand=True)
 
 levels_frame=ttk.LabelFrame(right,text=f" {ACTIVE_LAYOUT} CHANNEL LEVELS (%) ",padding=8); levels_frame.grid(row=1,column=0,sticky="nsew",pady=(7,0))
@@ -3124,6 +3763,48 @@ lfe_trim_var=tk.DoubleVar(value=cur.get("lfe_trim",0.0))
 bass_slope_var=tk.StringVar(value=str(cur.get("bass_slope","24")))
 bass_routing_var=tk.StringVar(value=str(cur.get("bass_routing","REDIRECT")))
 
+bass_rebuild_job = None
+bass_rebuild_busy = False
+
+def _bass_management_rebuild_worker(settings):
+    global bass_rebuild_busy
+    ok = False
+    try:
+        ok = rebuild_bass_management_graph(settings)
+        if ok:
+            # A filter-chain-only restart recreates EQ/Fill nodes; restore the
+            # saved gain/calibration state after the new graph is ready.
+            restore_live_eq_verified(settings, attempts=8)
+            apply_preamp(settings, bypass_var.get())
+            apply_channel_levels(settings, bypass_var.get())
+            route_speaker_fill_streams(settings, force_restart=False)
+    finally:
+        bass_rebuild_busy = False
+        root.after(0, lambda: status_var.set(
+            "Bass Management applied — 5.1 DSP graph rebuilt" if ok else
+            "Bass Management rebuild failed — previous audio graph retained"))
+
+def _start_bass_management_rebuild():
+    global bass_rebuild_job, bass_rebuild_busy
+    bass_rebuild_job = None
+    if bass_rebuild_busy:
+        # A slider may have changed again while the previous graph was loading.
+        bass_rebuild_job = root.after(350, _start_bass_management_rebuild)
+        return
+    bass_rebuild_busy = True
+    status_var.set("Applying Bass Management…")
+    settings = dict(DATA["current"])
+    threading.Thread(target=_bass_management_rebuild_worker, args=(settings,), daemon=True).start()
+
+def schedule_bass_management_rebuild():
+    global bass_rebuild_job
+    if bass_rebuild_job is not None:
+        try: root.after_cancel(bass_rebuild_job)
+        except Exception: pass
+    # Debounce the LFE Trim slider so dragging it does not repeatedly restart
+    # the graph. Buttons/radios still settle quickly.
+    bass_rebuild_job = root.after(300, _start_bass_management_rebuild)
+
 def save_bass_management(*args):
     DATA["current"]["bass_management"]=bool(bass_management_var.get())
     crossover=int(bass_crossover_var.get())
@@ -3136,11 +3817,13 @@ def save_bass_management(*args):
     save_data(DATA); update_crossover_graph()
     if is_bazzite():
         status_var.set("Bass Management saved; Bazzite EQ routing remains unchanged")
+    elif uses_dedicated_fill_route(DATA["current"]):
+        schedule_bass_management_rebuild()
     elif apply_bass_management_live(DATA["current"]):
         persist_bass_management_config(DATA["current"])
         status_var.set("Bass Management updated live")
     else:
-        status_var.set("Bass Management saved; reinstall/rebuild once to activate the v3.3.22 DSP graph")
+        status_var.set("Bass Management saved; reinstall/rebuild once to activate the DSP graph")
 
 def bass_tone(freq,lfe=False):
     if not shutil.which("speaker-test"): return
@@ -3175,6 +3858,7 @@ spatial_tab=ttk.Frame(notebook,padding=10); notebook.add(spatial_tab,text="◖  
 spatial_tab.columnconfigure(0,weight=1); spatial_tab.columnconfigure(1,weight=1)
 fill_frame=ttk.LabelFrame(spatial_tab,text=" SPEAKER FILL ",padding=12); fill_frame.grid(row=0,column=0,sticky="new",padx=(0,5),pady=(0,8))
 fill_mode=tk.StringVar(value=cur["fill_mode"])
+fill_engine_var=tk.StringVar(value=str(cur.get("fill_engine","application")))
 speaker_fill_lfe_buttons=[]
 def update_speaker_fill_lfe_state():
     state="disabled" if fill_mode.get()=="OFF" else "normal"
@@ -3184,6 +3868,9 @@ def on_fill_mode_change():
 for i,mode in enumerate(("OFF","PSD","FULL")):
     ttk.Radiobutton(fill_frame,text=mode,variable=fill_mode,value=mode,command=on_fill_mode_change).grid(row=0,column=i,padx=12,pady=3)
 ttk.Label(fill_frame,text="OFF = native channels   •   PSD = ambient surround   •   FULL = stronger all-speaker fill",style="Muted.TLabel",wraplength=540).grid(row=1,column=0,columnspan=3,sticky="w",pady=(8,0))
+ttk.Label(fill_frame,text="Fill Engine",style="Card.TLabel").grid(row=2,column=0,sticky="w",pady=(10,0))
+fill_engine_combo=ttk.Combobox(fill_frame,textvariable=fill_engine_var,state="readonly",width=18,values=("application","pipewire")); fill_engine_combo.grid(row=2,column=1,sticky="w",pady=(10,0))
+ttk.Label(fill_frame,text="Application = preferred DSP   •   PipeWire = compatibility fallback",style="Muted.TLabel",wraplength=540).grid(row=3,column=0,columnspan=3,sticky="w",pady=(6,0))
 
 spatial_controls=ttk.LabelFrame(spatial_tab,text=" LIVE SPATIAL CONTROLS ",padding=12); spatial_controls.grid(row=1,column=0,sticky="new",padx=(0,5),pady=(0,8))
 ttk.Label(spatial_controls,text="Rear Delay",style="Card.TLabel").grid(row=0,column=0,sticky="e")
@@ -3195,7 +3882,7 @@ lfe_cutoff=tk.StringVar(value=str(cur["lfe_cutoff"])); cross=ttk.Frame(spatial_c
 for hz in (80,100,120,150,180):
     button=ttk.Radiobutton(cross,text=f"{hz} Hz",variable=lfe_cutoff,value=str(hz),command=schedule_spatial_apply,style="SpeakerFill.TRadiobutton"); button.pack(side="left",padx=4); speaker_fill_lfe_buttons.append(button)
 update_speaker_fill_lfe_state()
-ttk.Label(spatial_controls,text="These controls update live without recreating the PipeWire stream.",style="Muted.TLabel").grid(row=3,column=0,columnspan=2,sticky="w",pady=(8,0))
+ttk.Label(spatial_controls,text="Explicit DSP on A52: OFF/PSD/FULL, rear delay, stereo width and LFE are processed in our 2→5.1 graph.",style="Muted.TLabel").grid(row=3,column=0,columnspan=2,sticky="w",pady=(8,0))
 
 bass_frame=ttk.LabelFrame(spatial_tab,text=" BASS MANAGEMENT ",padding=12); bass_frame.grid(row=0,column=1,rowspan=2,sticky="nsew",padx=(5,0),pady=(0,8))
 ttk.Checkbutton(bass_frame,text="Enable Bass Management",variable=bass_management_var,command=save_bass_management).grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,6))
@@ -3211,19 +3898,206 @@ tone_frame=ttk.Frame(bass_frame,style="Card.TFrame"); tone_frame.grid(row=5,colu
 ttk.Label(tone_frame,text="Bass Test:",style="Card.TLabel").pack(side="left")
 for f in (50,80,120): ttk.Button(tone_frame,text=f"{f} Hz",command=lambda x=f:bass_tone(x)).pack(side="left",padx=3)
 ttk.Button(tone_frame,text="LFE only",command=lambda:bass_tone(80,True)).pack(side="left",padx=3)
-crossover_canvas=tk.Canvas(bass_frame,height=180,bg="#071015",highlightthickness=1,highlightbackground=BORDER); crossover_canvas.grid(row=6,column=0,columnspan=4,sticky="ew",pady=(6,2)); crossover_canvas.bind("<Configure>",update_crossover_graph)
+crossover_canvas=tk.Canvas(bass_frame,height=180,bg="#0d1116",highlightthickness=1,highlightbackground=BORDER); crossover_canvas.grid(row=6,column=0,columnspan=4,sticky="ew",pady=(6,2)); crossover_canvas.bind("<Configure>",update_crossover_graph)
 root.after(200,update_crossover_graph)
 
-# ---------- Presets & Test ----------
-tools_tab=ttk.Frame(notebook,padding=10); notebook.add(tools_tab,text="★  Presets & Test")
-tools_tab.columnconfigure(0,weight=1); tools_tab.columnconfigure(1,weight=2); tools_tab.rowconfigure(0,weight=1)
-custom_frame=ttk.LabelFrame(tools_tab,text=" CUSTOM PRESET LIBRARY ",padding=12); custom_frame.grid(row=0,column=0,sticky="nsew",padx=(0,5))
-for row,slot in enumerate(("1","2","3","4","5")):
-    lbl=ttk.Label(custom_frame,text="",width=25,style="Card.TLabel"); lbl.grid(row=row,column=0,sticky="w",padx=5,pady=6); custom_name_labels[slot]=lbl
-    ttk.Button(custom_frame,text="Save / Rename",command=lambda s=slot:save_custom(s)).grid(row=row,column=1,padx=5,pady=4)
-ttk.Label(custom_frame,text="EQ presets do not alter your persistent speaker trims or master preamp.",style="Muted.TLabel",wraplength=350).grid(row=6,column=0,columnspan=2,sticky="w",pady=(14,0))
+# ---------- Speaker Setup ----------
+tools_tab=ttk.Frame(notebook,padding=10); notebook.add(tools_tab,text="▣  Speaker Setup")
+tools_tab.columnconfigure(0,weight=1); tools_tab.columnconfigure(1,weight=2); tools_tab.rowconfigure(1,weight=1)
 
-speaker_frame=ttk.LabelFrame(tools_tab,text=f" {ACTIVE_LAYOUT} SPEAKER TEST — ROOM VIEW ",padding=12); speaker_frame.grid(row=0,column=1,sticky="nsew",padx=(5,0))
+setup_frame=ttk.LabelFrame(tools_tab,text=" OUTPUT / SPEAKER CONFIGURATION ",padding=12); setup_frame.grid(row=0,column=0,columnspan=2,sticky="ew",pady=(0,8))
+setup_frame.columnconfigure(5,weight=1)
+output_connection_var=tk.StringVar(value=str(cur.get("output_connection","auto")))
+speaker_layout_var=tk.StringVar(value=str(cur.get("speaker_layout","auto")))
+output_setup_status_var=tk.StringVar(value="")
+output_setup_in_progress=False
+
+
+def save_speaker_setup_choice():
+    DATA["current"]["output_connection"] = output_connection_var.get()
+    DATA["current"]["speaker_layout"] = speaker_layout_var.get()
+    DATA["current"]["fill_engine"] = fill_engine_var.get()
+    save_data(DATA)
+
+def apply_fill_engine_choice():
+    save_speaker_setup_choice()
+    status_var.set("Switching Fill engine…")
+    settings = gui_settings()
+    settings["fill_engine"] = fill_engine_var.get()
+    DATA["current"]["fill_engine"] = fill_engine_var.get()
+    save_data(DATA)
+    def worker():
+        try:
+            ok = switch_fill_engine_live(settings)
+            text = ("Fill engine active — Application DSP" if fill_engine_var.get()=="application" else
+                    "Fill engine active — PipeWire compatibility") if ok else "Fill engine switch failed — previous route may still be active"
+        except Exception as exc:
+            text = f"Fill engine switch failed: {exc}"
+        root.after(0, lambda t=text: status_var.set(t))
+    threading.Thread(target=worker, daemon=True).start()
+
+fill_engine_combo.bind("<<ComboboxSelected>>", lambda _e: apply_fill_engine_choice())
+
+def apply_output_setup():
+    global output_setup_in_progress
+    if output_setup_in_progress:
+        return
+    output_setup_in_progress=True
+    apply_output_button.state(["disabled"])
+    connection_combo.configure(state="disabled")
+    layout_combo.configure(state="disabled")
+    output_setup_status_var.set("Applying output setup… Please wait. The app will restart automatically.")
+    status_var.set("Applying output setup — please wait")
+    root.update_idletasks()
+    save_speaker_setup_choice()
+    helper=Path.home()/".local/lib"/APP_ID/"setup"/"install.sh"
+    if not helper.exists():
+        output_setup_in_progress=False
+        apply_output_button.state(["!disabled"])
+        update_speaker_layout_state()
+        output_setup_status_var.set("")
+        messagebox.showerror(APP_NAME,"The installed output-setup helper is missing. Reinstall v3.3.65 from its package first.",parent=root); return
+    connection=output_connection_var.get(); layout=speaker_layout_var.get()
+    relaunch_helper=Path.home()/".local/lib"/APP_ID/"relaunch_helper.py"
+    old_gui_pid=os.getpid()
+    # Output setup runs in a temporary terminal because it can install packages
+    # and reload PipeWire. Once that work completes, ask the persistent per-user
+    # relaunch daemon to start a fresh GUI. The daemon survives every GUI exit,
+    # so repeated layout changes do not nest transient services or depend on the
+    # lifetime/environment of the temporary terminal.
+    relaunch=(
+        f'/usr/bin/python3 "{relaunch_helper}" --request {old_gui_pid} '
+        f'|| echo "Automatic relaunch request failed; start Sound Blaster Linux Control Center normally."'
+    )
+    cmd=(f'"{helper}" --connection "{connection}" --layout "{layout}" && '
+         f'echo; echo "Output setup complete. Relaunching Sound Blaster Linux Control Center…"; '
+         f'{relaunch}')
+    terminals=[["x-terminal-emulator","-e","bash","-lc",cmd],["konsole","-e","bash","-lc",cmd],["gnome-terminal","--","bash","-lc",cmd]]
+    for argv in terminals:
+        if shutil.which(argv[0]):
+            subprocess.Popen(argv)
+            output_setup_status_var.set("Output setup started — waiting for audio reconfiguration…")
+            status_var.set("Applying output setup — the app will relaunch automatically")
+            # The GUI can leave non-daemon audio/analyzer helpers alive after
+            # root.destroy(), which keeps this PID and the single-instance lock
+            # around even though the window is gone.  For an intentional output
+            # reconfiguration, save/clean up synchronously and then terminate the
+            # GUI process completely; the detached terminal/helper survives and
+            # relaunches a fresh instance after the setup completes.
+            analyzer_stop.set()
+            _stop_analyzer_processes()
+            save_current_state()
+            try:
+                if SOCKET_PATH.exists(): SOCKET_PATH.unlink()
+            except Exception:
+                pass
+            root.update_idletasks()
+            time.sleep(0.35)
+            os._exit(0)
+    output_setup_in_progress=False
+    apply_output_button.state(["!disabled"])
+    update_speaker_layout_state()
+    output_setup_status_var.set("")
+    try: apply_output_button.state(["!disabled"])
+    except Exception: pass
+    messagebox.showinfo(APP_NAME,f"Run this command in a terminal:\n\n{helper} --connection {connection} --layout {layout}",parent=root)
+
+ttk.Label(setup_frame,text="Connection",style="Card.TLabel").grid(row=0,column=0,sticky="w")
+connection_combo=ttk.Combobox(setup_frame,textvariable=output_connection_var,state="readonly",width=18,values=("auto","digital","analog")); connection_combo.grid(row=1,column=0,sticky="w",padx=(0,14))
+ttk.Label(setup_frame,text="Speaker Layout",style="Card.TLabel").grid(row=0,column=1,sticky="w")
+MANUAL_LAYOUTS=("stereo","2.1","4.0","4.1","5.0","5.1")
+layout_combo=ttk.Combobox(setup_frame,textvariable=speaker_layout_var,state="readonly",width=12,values=MANUAL_LAYOUTS); layout_combo.grid(row=1,column=1,sticky="w",padx=(0,14))
+auto_layout_var=tk.StringVar(value=f"Auto-detected: {ACTIVE_LAYOUT}")
+auto_layout_label=ttk.Label(setup_frame,textvariable=auto_layout_var,style="Muted.TLabel")
+auto_layout_label.grid(row=1,column=2,sticky="w",padx=(0,14))
+def update_speaker_layout_state(*_):
+    is_auto = output_connection_var.get() == "auto"
+    layout_combo.configure(state="disabled" if is_auto else "readonly")
+    if is_auto:
+        speaker_layout_var.set("auto")
+        auto_layout_label.grid()
+    else:
+        # Auto is a connection mode, not a manual speaker-layout choice.
+        # When leaving Auto, start from the currently detected live layout.
+        if speaker_layout_var.get() not in MANUAL_LAYOUTS:
+            speaker_layout_var.set(ACTIVE_LAYOUT if ACTIVE_LAYOUT in MANUAL_LAYOUTS else "5.1")
+        auto_layout_label.grid_remove()
+    save_speaker_setup_choice()
+connection_combo.bind("<<ComboboxSelected>>", update_speaker_layout_state)
+layout_combo.bind("<<ComboboxSelected>>", lambda _e: save_speaker_setup_choice())
+update_speaker_layout_state()
+apply_output_button=ttk.Button(setup_frame,text="Apply Output Setup",style="Accent.TButton",command=apply_output_setup)
+apply_output_button.grid(row=1,column=3,sticky="w",padx=(4,10))
+output_setup_status_label=ttk.Label(setup_frame,textvariable=output_setup_status_var,style="Muted.TLabel",wraplength=1040)
+output_setup_status_label.grid(row=2,column=0,columnspan=6,sticky="w",pady=(9,0))
+def manually_use_soundblaster():
+    """Explicit takeover button; does not change the user's auto-switch policy."""
+    use_soundblaster_button.state(["disabled"])
+    status_var.set("Selecting Sound Blaster…")
+    def worker():
+        ok, result = select_soundblaster_explicitly(move_existing=True)
+        def finish():
+            use_soundblaster_button.state(["!disabled"])
+            status_var.set(result)
+        root.after(0, finish)
+    threading.Thread(target=worker, daemon=True).start()
+
+use_soundblaster_button=ttk.Button(setup_frame,text="Use Sound Blaster",style="Accent.TButton",command=manually_use_soundblaster)
+use_soundblaster_button.grid(row=1,column=4,sticky="w",padx=(4,10))
+ttk.Label(setup_frame,text="Manual fallback: selects the Sound Blaster EQ and moves active playback streams once. Linux still controls later headset/device switching.",style="Muted.TLabel",wraplength=1040).grid(row=4,column=0,columnspan=6,sticky="w",pady=(7,0))
+
+ANALOG_EXPERIMENTAL_LAYOUTS = frozenset(("4.0", "4.1", "5.0", "5.1"))
+analog_warning_var=tk.StringVar(value="")
+ttk.Label(setup_frame,textvariable=analog_warning_var,foreground=WARN,background=CARD,wraplength=1040).grid(row=5,column=0,columnspan=6,sticky="w",pady=(5,0))
+
+def update_analog_experimental_warning(*_):
+    conn=output_connection_var.get()
+    layout=speaker_layout_var.get()
+    if conn == "analog" and layout in ANALOG_EXPERIMENTAL_LAYOUTS:
+        analog_warning_var.set("EXPERIMENTAL — Analog speaker configurations above 2.1 depend on sound-card firmware and Linux driver routing; all channels may not work correctly. Digital 5.1 is separate.")
+    else:
+        analog_warning_var.set("")
+
+output_connection_var.trace_add("write", update_analog_experimental_warning)
+speaker_layout_var.trace_add("write", update_analog_experimental_warning)
+update_analog_experimental_warning()
+
+ttk.Label(setup_frame,text="Auto detects the active connection and layout. Choose Digital or Analog to manually select a speaker layout. Changing connection/layout runs the same distro-aware setup used by the installer.",style="Muted.TLabel",wraplength=1040).grid(row=3,column=0,columnspan=6,sticky="w",pady=(5,0))
+
+def _apply_output_startup_guard():
+    guard_seconds=4.0
+    cooldown_path = RUNTIME_DIR / f"{APP_ID}-relaunch-cooldown"
+    try:
+        stamp = float(cooldown_path.read_text().strip())
+    except Exception:
+        return
+    remaining = guard_seconds - max(0.0, time.time() - stamp)
+    if remaining <= 0:
+        try:
+            cooldown_path.unlink()
+        except Exception:
+            pass
+        return
+
+    apply_output_button.state(["disabled"])
+    connection_combo.configure(state="disabled")
+    layout_combo.configure(state="disabled")
+    output_setup_status_var.set("Output setup complete — audio is settling. Please wait…")
+
+    def _finish_output_setup_settle():
+        apply_output_button.state(["!disabled"])
+        update_speaker_layout_state()
+        output_setup_status_var.set("Ready for another output change.")
+        try:
+            cooldown_path.unlink()
+        except Exception:
+            pass
+
+    root.after(max(1, int(remaining * 1000)), _finish_output_setup_settle)
+
+_apply_output_startup_guard()
+
+speaker_frame=ttk.LabelFrame(tools_tab,text=f" {ACTIVE_LAYOUT} SPEAKER TEST — ROOM VIEW ",padding=12); speaker_frame.grid(row=1,column=0,columnspan=2,sticky="nsew")
 for c in range(5):speaker_frame.columnconfigure(c,weight=1)
 for r in range(5):speaker_frame.rowconfigure(r,weight=1)
 def make_speaker_test_button(channel,label,row,col):
@@ -3401,24 +4275,59 @@ ttk.Label(about_box,text=f"Detected layout: {ACTIVE_LAYOUT}\nChannels: {' '.join
 contact_frame=ttk.Frame(about_box,style="Card.TFrame")
 contact_frame.pack(fill="x",pady=(14,0))
 ttk.Label(contact_frame,text="Created by !!ZuEs!!",style="Card.TLabel",font=("Arial",11,"bold")).pack(anchor="w")
-ttk.Label(contact_frame,text="Contact: zuestgg@gmail.com",style="Muted.TLabel").pack(anchor="w",pady=(2,0))
+ttk.Label(contact_frame,text="Project support and bug reports are handled through GitHub.",style="Muted.TLabel").pack(anchor="w",pady=(2,8))
+about_links=ttk.Frame(contact_frame,style="Card.TFrame"); about_links.pack(anchor="w")
+ttk.Button(about_links,text="GitHub Project",command=lambda: webbrowser.open("https://github.com/cpugod55/soundblaster-linux-control-center")).pack(side="left")
+ttk.Button(about_links,text="Report an Issue",command=lambda: webbrowser.open("https://github.com/cpugod55/soundblaster-linux-control-center/issues")).pack(side="left",padx=(8,0))
+ttk.Button(about_links,text="Support / Sponsor",command=lambda: webbrowser.open("https://github.com/sponsors/cpugod55")).pack(side="left",padx=(8,0))
 if SIGNATURE_IMAGE.exists():
     try:
         dev_sig=tk.PhotoImage(file=str(SIGNATURE_IMAGE)); dev_sig_lbl=tk.Label(about_box,image=dev_sig,bg=CARD,borderwidth=0); dev_sig_lbl.image=dev_sig; dev_sig_lbl.pack(anchor="e",pady=(10,0))
     except Exception:pass
 
 # Real bottom status bar.
-bottom=tk.Frame(root,bg="#050b0f",highlightthickness=1,highlightbackground=BORDER);bottom.pack(fill="x",padx=18,pady=(0,10))
-tk.Label(bottom,text="PipeWire / WirePlumber",bg="#050b0f",fg=MUTED).pack(side="left",padx=10,pady=5)
-tk.Label(bottom,text=f"Layout: {ACTIVE_LAYOUT}",bg="#050b0f",fg=MUTED).pack(side="left",padx=10)
-tk.Label(bottom,textvariable=status_var,bg="#050b0f",fg=GOOD).pack(side="left",padx=18)
-tk.Label(bottom,text=f"{VERSION}  •  !!ZuEs!!",bg="#050b0f",fg="#d9c391").pack(side="right",padx=10)
+bottom=tk.Frame(root,bg=PANEL,highlightthickness=1,highlightbackground=BORDER);bottom.pack(fill="x",padx=18,pady=(0,10))
+tk.Label(bottom,text="PipeWire / WirePlumber",bg=PANEL,fg=MUTED).pack(side="left",padx=10,pady=5)
+tk.Label(bottom,text=f"Layout: {ACTIVE_LAYOUT}",bg=PANEL,fg=MUTED).pack(side="left",padx=10)
+tk.Label(bottom,textvariable=status_var,bg=PANEL,fg=GOOD).pack(side="left",padx=18)
+tk.Label(bottom,text=f"{VERSION}  •  !!ZuEs!!",bg=PANEL,fg=ACCENT2).pack(side="right",padx=10)
+
+# Read-only default-output watcher.  v3.3.65 routing was stable; do not
+# introduce automatic profile changes or service restarts without field tests.
+# On return to Sound Blaster, reassert only gain/EQ state of its existing sink.
+_device_previous_default = default_sink_name()
+_device_restore_busy = False
+
+def _restore_on_soundblaster_return():
+    global _device_restore_busy
+    try:
+        settings = dict(DATA.get("current", {}))
+        if not soundblaster_default_selected() or not sink_exists(SINK):
+            return
+        restore_live_eq_verified(settings, attempts=3)
+        restore_channel_levels_verified(settings, attempts=2)
+        restore_preamp_verified(settings, attempts=3, persist=False)
+    finally:
+        _device_restore_busy = False
+
+def monitor_audio_selection():
+    global _device_previous_default, _device_restore_busy
+    now = default_sink_name()
+    if now and now != _device_previous_default:
+        previously_sb = soundblaster_default_selected(_device_previous_default)
+        now_sb = soundblaster_default_selected(now)
+        _device_previous_default = now
+        if now_sb and not previously_sb and not _device_restore_busy:
+            _device_restore_busy = True
+            threading.Thread(target=_restore_on_soundblaster_return, daemon=True).start()
+    root.after(2500, monitor_audio_selection)
 
 # Initialize
 gui_ready = True
 # Reassert saved EQ, channel calibration and Safe Headroom on every normal launch.
 # Run the bounded verification off the Tk event thread so startup remains responsive.
 threading.Thread(target=restore_gui_audio_state, daemon=True).start()
+threading.Thread(target=fill_route_maintenance_worker, daemon=True).start()
 # Highlight a matching saved preset name when possible. If no exact recall key can
 # be established, the UI simply reports Current until the user selects one.
 saved_name = DATA["current"].get("last_preset", "Current")
@@ -3429,6 +4338,6 @@ for _slot, _entry in DATA["custom_presets"].items():
     if saved_name == _entry.get("name") and _entry.get("settings"):
         active_preset_key = f"custom:{_slot}"
 refresh_preset_labels(); refresh_device_list(); update_mute_button(); update_headroom_warning()
-update_connection_status(); start_analyzer()
+update_connection_status(); monitor_audio_selection(); start_analyzer()
 root.protocol("WM_DELETE_WINDOW", on_close)
 root.mainloop()

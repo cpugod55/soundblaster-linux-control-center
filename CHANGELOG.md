@@ -1,3 +1,195 @@
+## v3.3.7 — Community testing pre-release (renamed from verified v3.3.68-test4)
+
+- Same audio behavior as hardware-tested v3.3.68-test4, with package/version metadata renamed to v3.3.7.
+- Automatic device selection remains governed by the OS/WirePlumber; a user-level background observer restores selected Sound Blaster EQ, AC3 5.1, and Speaker Fill when returning from other devices.
+- Keeps manual **Use Sound Blaster** action and experimental warnings for analog layouts beyond 2.1.
+- Maintainer verified Ubuntu KDE hardware, including approximately 1–2-second return-to-surround recovery with GUI closed. Further distro/hardware reports requested.
+
+## v3.3.68-test4 — repair background Speaker Fill restore (experimental)
+
+- Fixes a confirmed `NameError: update_fill_processing is not defined` when using the GUI-independent `--restore-selected` command. It previously ran before its Speaker Fill and stream-enumeration functions were defined.
+- Moves only the required headless helper function definitions before the CLI dispatch; preserves the GUI's DSP and processing behavior.
+- Reports an incomplete restore if Speaker Fill control programming fails, instead of misleadingly logging success.
+- Adds a regression test checking that the headless command runs after all of its required functions are defined.
+- This remains an experimental release; Ubuntu/KDE device testing and cross-distribution hardware validation are still required.
+
+## v3.3.68-test4 — background return-to-speakers recovery (experimental)
+
+- Adds a background, GUI-independent audio return observer using standard PipeWire/Pulse compatibility interfaces, run under systemd --user.
+- A selected Sound Blaster card may have its saved surround profile and EQ reasserted after headset disconnect. Never forces selection of an unrelated output.
+- Retains digital 5.1, v3.3.65 relaunch safety, test1 Use Sound Blaster button, and experimental analog >2.1 warnings.
+
+## 3.3.65
+- Prevent rapid repeated Output Setup changes from racing the relaunch/audio-settling cycle. Apply, Connection, and Speaker Layout are disabled while a change is being handed off.
+- Show in-app Output Setup progress text, including a clear post-relaunch “audio is settling” message.
+- Relaunched instances now carry an internal marker and enforce a 4.5-second settling window before another Output Setup change can be applied.
+
+# 3.3.65
+
+- Reworked Output Setup relaunch around a persistent per-user helper service instead of transient GUI services or terminal-owned `gtk-launch`.
+- The installer now installs and starts `soundblaster-zse-relaunch-helper.service`; after audio reconfiguration the temporary setup terminal only sends the old GUI PID to that helper.
+- The helper waits for the old GUI to be gone, then launches a fresh `~/.local/bin/soundblaster-zse-control` while remaining alive for subsequent layout/connection changes.
+- Uninstall now disables and removes the relaunch helper service.
+
+# 3.3.63
+
+- Replaced the transient systemd-owned GUI relaunch after Apply Output Setup with the desktop-session launch path verified on KDE/Wayland.
+- After output reconfiguration, the helper waits briefly and runs `gtk-launch soundblaster-zse-control`, matching a normal desktop-menu launch.
+- Preserved the working digital logical-layout switching and existing DSP/fill behavior.
+
+## 3.3.63
+- Fix repeated Output Setup relaunches by giving every systemd --user transient relaunch service a unique PID + nanosecond unit name.
+- Preserve the verified live Digital logical-layout switching and existing DSP paths unchanged.
+
+## 3.3.63
+- Fix Output Setup automatic relaunch by handing the replacement GUI to an independent `systemd --user` transient service.
+- The relaunch service waits two seconds after output reconfiguration, then starts the control center; this replaces the unreliable terminal-owned `nohup`/PID-wait path.
+- Preserve the verified digital logical-layout switching and Fill-engine behavior from 3.3.60.
+
+## 3.3.63
+- Fix automatic GUI relaunch after Apply Output Setup by waiting for the exact old GUI PID to exit before starting the replacement instance.
+- Preserve the verified digital logical-layout switching introduced in 3.3.57/3.3.58.
+
+## 3.3.63
+
+- Speaker Setup manual layout menu no longer includes `auto`; Auto is now exclusively a Connection mode.
+- Leaving Connection=Auto initializes the manual layout selector from the currently detected live layout.
+- Output Setup relaunch now waits for the old GUI single-instance lock to release and launches the replacement GUI detached from the temporary terminal.
+- Preserves the verified v3.3.57 live Digital layout switching and v3.3.56 Fill/preset fixes.
+
+## 3.3.57
+
+- Fix custom preset recall status: the bottom status bar now updates to the selected custom preset instead of retaining the previous built-in preset name.
+- No EQ/DSP recall behavior changed; this is a display-state fix only.
+
+## 3.3.55
+- Reorganized EQ preset management onto the main EQ & Levels page.
+- Renamed Presets & Test to Speaker Setup.
+- Added in-app Connection and Speaker Layout selectors using the existing distro-aware installer backend.
+- Added selectable Application (preferred) vs PipeWire compatibility Speaker Fill engine.
+- Preserved v3.3.53 DSP/settings behavior as the rollback baseline.
+
+## 3.3.53 - 2026-09-09
+
+- Add openSUSE Tumbleweed `zypper` dependency support, including `alsa-plugins-a52` and the LADSPA ZaMaxim package.
+- Add an openSUSE persistent A52 path using the hardware-verified `plug:a52:<Creative ALSA card>` PCM; do not depend on `aplay -L` exposing an A52 hint.
+- Enable both Creative `IEC958` and `IEC958 Default PCM` playback switches when available before creating the A52 sink.
+- On clean Debian Live sessions, start the user PipeWire/WirePlumber/PipeWire-Pulse services before `pactl` card detection and emit a clear connection diagnostic instead of silently exiting.
+- Deduplicate Debian dependency package names.
+- Preserve v3.3.52 DSP, EQ, Speaker Fill, Bass Management, channel mapping, and Bazzite behavior.
+
+## 3.3.52 - 2026-09-09
+
+## v3.3.52 — Ubuntu explicit Speaker Fill test
+
+- Extends the verified v3.3.51 explicit stereo-to-5.1 Speaker Fill DSP to Ubuntu native `iec958-ac3-surround-51` targets for direct listening tests.
+- Preserves the v3.3.51 Fill topology and coefficients exactly: OFF front-only, PSD difference rears, FULL 0.75 rear duplication, 0.5+0.5 center and low-passed LFE, Rear Delay, and Stereo Width.
+- Keeps Ubuntu EQ target/compatibility behavior unchanged; only stereo Speaker Fill routing is moved to the persistent explicit Fill sink.
+- Keeps Bazzite on its already-verified compatibility Fill path unchanged.
+- v3.3.51 remains the saved verified rollback checkpoint.
+
+## 3.3.52 - 2026-09-09
+
+## v3.3.52 — Mint Bass Management graph rebuild + blue accent
+
+- Preserves the verified v3.3.50 explicit Speaker Fill DSP unchanged.
+- On persistent A52/dedicated-Fill systems, Bass Management changes are now baked into the explicit six-channel EQ/bass graph and the user filter-chain service is recreated, instead of trusting live biquad/mixer property updates that Mint can acknowledge without applying audibly.
+- Bass graph rebuild runs off the Tk thread and is debounced for LFE Trim slider changes.
+- Reasserts EQ, preamp, channel calibration, and the verified Fill route after the filter-chain-only restart.
+- Restores the Sound Blaster UI accent from red to blue.
+
+
+- Replaces the non-Atomic A52 Speaker Fill channelmix path with an explicit 2-to-5.1 PipeWire filter-chain graph. OFF, PSD, FULL, Rear Delay, Stereo Width, Center synthesis, and Speaker Fill LFE low-pass are now owned by the application DSP instead of PipeWire's automatic channel mixer.
+- PSD rear fill uses L-R / R-L ambience so centered dialogue is intentionally reduced in the rear channels; FULL duplicates left/right into the rears with controlled gain.
+- The explicit graph outputs canonical `FL FR RL RR FC LFE` directly into `soundblaster_zse_eq` with remixing disabled on the graph output, making channel identity deterministic before EQ/Bass Management.
+- Upgrading from v3.3.43-v3.3.49 removes only the old named `pw-loopback` Fill process before loading the explicit graph so a stale `soundblaster_zse_fill` node cannot be mistaken for the new DSP.
+- Bazzite retains its previously verified compatibility loopback unchanged.
+- Refreshes the visual system toward the AMD Linux Control Center family: neutral dark cards, red accent treatment, dashboard-style header/status chips, and matching slider accents.
+- Preserves the v3.3.49 privacy-safe About links and Cinnamon `StartupNotify=false` fix.
+
+## 3.3.49
+
+- Restores the privacy-safe About/Package presentation lost during the v3.3.38 source sync: the maintainer email is no longer displayed in the application.
+- Adds direct About-page buttons for the GitHub project, GitHub Issues, and GitHub Sponsors support page.
+- Preserves all v3.3.48 Mint/older-PipeWire compatibility work, including Fill-loopback recreation on PipeWire older than 1.2 and Cinnamon startup-notification handling.
+- Adds regression coverage so private contact text and project/support links cannot silently regress again.
+
+## 3.3.48 - 2026-09-09
+
+- Mint/older-PipeWire Speaker Fill compatibility: on PipeWire older than 1.2, recreate only the dedicated Fill loopback when OFF/PSD/FULL, Rear Delay, Stereo Width, or Fill LFE cutoff changes. Mint 22.3 testing showed live Props readback changed while the running channel mixer remained audibly unchanged.
+- Wait for the old Fill sink to disappear before creating its replacement so stale nodes cannot satisfy readiness checks.
+- Preserve the verified zero-restart live update path on newer Fedora/CachyOS PipeWire releases.
+- Disable desktop `StartupNotify`; the Tk app does not complete Cinnamon's startup-notification protocol and could leave a busy cursor until clicked.
+
+## 3.3.47 - 2026-09-09
+
+- Fixes the dedicated A52 Speaker Fill route so its 2-channel-to-5.1 playback stream explicitly allows PipeWire channel remixing instead of contradicting the requested `channelmix.upmix` DSP with `stream.dont-remix=true`.
+- Restores live OFF / PSD / FULL Speaker Fill behavior, Rear Delay, Stereo Width, and Speaker Fill LFE Crossover on the persistent A52 path used by Linux Mint, Fedora, and Arch/CachyOS digital 5.1 compatibility routing.
+- Keeps the explicit six-channel Bass Management DSP graph enabled when the EQ uses A52 compatibility targeting; compatibility routing now changes target attachment only and no longer silently disables Bass Management.
+- Bass Management persistence preserves A52 `target.object` routing while regenerating the six-channel graph.
+- Preserves the verified Bazzite compatibility graph unchanged.
+- Retains the v3.3.46 Linux Mint meter/analyzer and non-blocking Fill-maintenance fixes.
+
+## 3.3.46 - 2026-09-09
+
+- Fix Linux Mint 22.x Live Output Levels and spectrum capture on PipeWire builds whose `pw-record` does not support the newer `--raw` option. The app now capability-detects `--raw` and uses the compatible stdout capture form when it is unavailable.
+- Move persistent A52/Bazzite Speaker Fill stream maintenance off the Tk GUI event thread so the 1.5-second connection-status poll cannot stall controls on slower PipeWire releases.
+- Serialize interactive Fill updates against background stream maintenance, preventing overlapping `pw-dump`/`pw-cli`/stream-move work while OFF/PSD/FULL is being changed.
+- Preserve the v3.3.45 Mint/Debian A52 installer fixes, the v3.3.44 Fedora fixes, and the v3.3.43 persistent A52 Fill architecture.
+
+## 3.3.45 - 2026-09-09
+
+- Extended persistent Digital AC3/A52 5.1 setup to Debian/Ubuntu/Linux Mint systems when a native Creative AC3 profile is unavailable.
+- Preserves native `iec958-ac3-surround-51` when the Creative card advertises it; otherwise dynamically discovers the Creative IEC958 ALSA card/device and creates `alsa_output.soundblaster_a52_51`.
+- Debian-family A52 capability detection now recognizes installed `libasound2-plugins` even when `aplay -L` omits the `a52` PCM hint.
+- Automatically enables the Creative IEC958 playback switch before handing the digital PCM to A52 when the mixer exposes that control.
+- Explicit `--connection digital --layout 5.1` is fail-closed on non-Atomic supported systems and can no longer fall through to a headset, HDMI, or analog stereo sink.
+- Debian/Ubuntu/Mint dependency setup now repairs stale `deb cdrom:` Live-media APT entries after a failed package-index update, backs up the affected source file, and retries.
+- Retains all v3.3.44 Fedora fixes and the v3.3.43 persistent Fill-routing behavior.
+
+## 3.3.44 - 2026-09-09
+
+- Fedora Digital 5.1 now uses the same persistent A52/AC3 sink architecture validated on CachyOS, with Creative ALSA card/device discovery from `aplay -l` rather than hard-coded card numbers.
+- Fedora A52 detection now accepts the installed `alsa-plugins-a52` RPM even when `aplay -L` omits the `a52` hint.
+- If the Creative card exposes an `IEC958` playback switch, the installer unmutes it before creating the A52 sink. This fixes Fedora Live boots where the encoder opened correctly but S/PDIF playback was muted.
+- Explicit `--connection digital --layout 5.1` on Fedora now uses the persistent A52 path and fails closed instead of falling through to an unrelated stereo USB/analog sink.
+- Installer application version is isolated from `/etc/os-release`, preventing Fedora's OS `VERSION` value from replacing the Sound Blaster Control Center version in install output.
+- Preserves v3.3.43 dedicated A52 speaker-fill routing and all prior stale-target and CA0132 fixes.
+
+## 3.3.43 - 2026-09-08
+- Fix CachyOS/Arch Digital 5.1 Speaker Fill routing regression found during live v3.3.42 testing.
+- A52/AC3 targets now use the persistent `soundblaster_zse_fill` path, so changing OFF/PSD/FULL no longer restarts `pipewire-pulse` and tears down the AC3 sink.
+- The connection-status loop keeps stereo application streams on the stable fill sink while native multichannel streams remain discrete.
+- Installer writes non-global upmix defaults for the A52 target so the dedicated fill path owns stereo upmix behavior.
+
+## 3.3.42 - 2026-09-08
+
+- Fix CachyOS/Arch Digital 5.1 startup when the normal Creative IEC958 profile already owns the S/PDIF PCM.
+- Digital 5.1 now releases the Creative ACP profile before starting the persistent A52/AC3 sink, preventing `Device or resource busy`.
+- If A52 startup fails, the installer restores the previously active Creative profile instead of leaving the card disabled.
+- Explicit Digital 5.1 still fails closed and never falls back to analog.
+
+## 3.3.41 - 2026-09-08
+
+- Fix CachyOS/Arch persistent A52 sink generation: correct PipeWire config escaping and correctly parse the Creative IEC958 ALSA device number from `aplay -l`.
+- When `--connection digital --layout 5.1` is explicit, installation now stops on AC3 sink creation failure instead of silently falling back to analog.
+
+## 3.3.40 - 2026-09-08
+
+- Add installer output selection: `--connection auto|analog|digital` and capability-driven `--layout`.
+- Add Arch/CachyOS Digital 5.1 A52 sink creation using the discovered Creative IEC958 ALSA device.
+- Treat installed Arch `pcm_a52` as valid even when `aplay -L` does not advertise `a52`.
+- Stop preserving unrelated stale USB/HDMI targets when a Creative card is present.
+- Add clear fresh-Live pacman database action and improved Bazzite Atomic ACTION REQUIRED guidance.
+- Preserve v3.3.39 same-device stale stereo-to-live-5.1 correction.
+
+## 3.3.39
+
+- Fixes an upgrade-path regression where a preserved `analog-stereo` EQ target could survive after the same device had switched to a live `analog-surround-51` sink, causing `soundblaster_zse_eq` to be regenerated as 2-channel stereo.
+- Installer target preservation now follows only the exact live 5.1 sibling of a stale `analog-stereo` node; existing surround, AC3, unrelated stereo, and CA0132 physical channel-map behavior are unchanged.
+- `--generate-eq-config` applies the same narrow live-sibling resolution so direct/config-generation paths cannot recreate the stale stereo target.
+- Adds a regression test for the gjohnz v3.3.38 failure pattern: preserved stereo target + live 5.1 sibling must generate a 6-channel EQ targeting `analog-surround-51`.
+
 ## 3.3.38
 
 - Fixes cross-distro LADSPA dependency installation: Arch/CachyOS now installs `zam-plugins-ladspa`; Fedora installs `ladspa-zam-plugins`; Bazzite/Fedora Atomic reports `ladspa-zam-plugins` as a required layered package when missing.
@@ -302,3 +494,10 @@
 ## 3.3.2
 - Expanded README with a basic quick-start installation section.
 - Added standalone TROUBLESHOOTING.md covering routing, 5.1 optical, device profiles, analyzer, speaker test, Mic/Line In, processed microphone, line monitoring, dependencies, and bug-report diagnostics.
+
+
+## 3.3.68-test4 (unreleased)
+- Manual Use Sound Blaster fallback, vendor-neutral audio handoff, passive EQ restore on return, experimental analog >2.1 labeling. See RELEASE_TEST_NOTES.md.
+
+## 3.3.68-test4 (unreleased)
+- Detect device routing changes without relying on default sink changes; restore existing SBLCC speaker-fill routing with GUI closed.
